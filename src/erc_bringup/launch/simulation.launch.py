@@ -211,8 +211,15 @@ def generate_launch_description():
         spawner('arm_right_controller', controller_params),
         spawner('head_controller', controller_params),
         spawner('torso_controller', controller_params),
-        spawner('gripper_left_controller', controller_params),
-        spawner('gripper_right_controller', controller_params),
+        spawner('gripper_left_controller_raw', controller_params),
+        spawner('gripper_right_controller_raw', controller_params),
+    ])
+
+    # ── Gripper command clamp ──
+    gripper_clamp = TimerAction(period=9.0, actions=[
+        Node(package='erc_bringup', executable='gripper_command_clamp.py',
+             parameters=[{'use_sim_time': True}],
+             output='screen'),
     ])
 
     # ── Book colour substitution ──
@@ -321,6 +328,6 @@ def generate_launch_description():
                                           'sensors/depth_to_cloud (owns '
                                           '/head_front_camera/depth/points)'),
         gazebo_gui, gazebo_headless,
-        rsp, bridge, head_camera_bridge, contact_bridge, spawn_tiago_pro, controllers, spawn_books, spawn_number_markers,
-        *depth_cloud_actions,
+        rsp, bridge, head_camera_bridge, contact_bridge, spawn_tiago_pro, controllers, gripper_clamp,
+        spawn_books, spawn_number_markers, *depth_cloud_actions,
     ])

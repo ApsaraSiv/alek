@@ -8,5 +8,5 @@
     arm_right_controller.type: joint_trajectory_controller/JointTrajectoryController
     head_controller.type: joint_trajectory_controller/JointTrajectoryController
     torso_controller.type: joint_trajectory_controller/JointTrajectoryController
-    gripper_left_controller.type: joint_trajectory_controller/JointTrajectoryController
-    gripper_right_controller.type: joint_trajectory_controller/JointTrajectoryController
+    gripper_left_controller_raw.type: joint_trajectory_controller/JointTrajectoryController
+    gripper_right_controller_raw.type: joint_trajectory_controller/JointTrajectoryController

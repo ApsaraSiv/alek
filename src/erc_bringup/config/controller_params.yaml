@@ -36,13 +36,13 @@ torso_controller:
     command_interfaces: [position]
     state_interfaces: [position]
 
-gripper_left_controller:
+gripper_left_controller_raw:
   ros__parameters:
     joints: [gripper_left_finger_joint]
     command_interfaces: [position]
     state_interfaces: [position, velocity]
 
-gripper_right_controller:
+gripper_right_controller_raw:
   ros__parameters:
     joints: [gripper_right_finger_joint]
     command_interfaces: [position]
