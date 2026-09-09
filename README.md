@@ -1,3 +1,6 @@
+### Competition Rules Updated 09/09/26
+Book spine width reduced from **3cm to 2cm**. Please update parameters accordingly.
+
 # Emirates Robotics Competition 2026
 
 Library Assistant Robot challenge: Autonomous book retrieval using a TIAGo Pro mobile manipulator.
