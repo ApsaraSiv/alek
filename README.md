@@ -1,5 +1,9 @@
-### Competition Rules Updated 09/09/26
-Book spine width reduced from **3cm to 2cm**. Please update parameters accordingly.
+### Updates 11/09/26
+- Competition Rules Update: Book spine width reduced from **3cm to 2cm**. Please update parameters accordingly.
+- Manipulation: A possible workaround to issue [#2](https://github.com/dfl-rlab/erc_sim_2026/issues/2) is using the position controller and the effort interface feedback from the gripper to keep publishing position in a closed-loop. This produces the following video:
+
+[tiago_pro_book_grip_test.webm](https://github.com/user-attachments/assets/90e8d60b-9724-4ee1-ae07-955a705a5bdf)
+
 
 # Emirates Robotics Competition 2026
 
