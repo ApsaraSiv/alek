@@ -43,6 +43,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-realsense2-description \
     && rm -rf /var/lib/apt/lists/*
 
+# 3.5. OCR (erc_perception's shelf_number_detector reads the overhead
+# shelf-column marker digits via tesseract)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir pytesseract
+
 # 4. Workspace directory (source is mounted from host at runtime)
 ENV GZ_VERSION=harmonic
 RUN mkdir -p /opt/erc_ws/src
