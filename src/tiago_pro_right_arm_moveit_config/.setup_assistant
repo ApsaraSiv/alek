@@ -1,0 +1,10 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: erc_description
+    relative_path: urdf/tiago_pro.urdf
+  srdf:
+    relative_path: config/tiago_pro.srdf
+  package_settings:
+    author_name: ""
+    author_email: ""
+    generated_timestamp: 1789305767
