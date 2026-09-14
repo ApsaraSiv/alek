@@ -21,7 +21,15 @@ prototype (verified end-to-end against move_group in Gazebo -- see that
 package for the original dev/test harness). The prototype ran its sequence
 autonomously off a single pose topic; this version is restructured as
 service handlers callable from state_machine_node, consuming the contract's
-/erc/target_book_point and /erc/collection_bin_point instead.
+/erc/target_book_point for grasp_book.
+
+place_in_bin does NOT use a live point: INTERFACES.md still describes
+/erc/collection_bin_point (geometry_msgs/PointStamped) from bin_detector,
+but the real bin_detector (erc_perception, merged after that doc was
+written) only publishes /erc/bin_identification -- a visibility Bool, not
+a point. Nothing publishes a bin point. Instead this uses a fixed pose in
+the planning frame, since navigate_to_bin (navigation_node) already parks
+the robot at a known standoff facing the bin -- see STILL TO TUNE below.
 
 Runs under a MultiThreadedExecutor with a ReentrantCallbackGroup so a
 blocking service call (grasp_book/place_in_bin) doesn't starve the
@@ -32,11 +40,15 @@ which tries to attach this node to a second executor and fails since the
 node is already spinning under executor.spin()).
 
 STILL TO TUNE:
-  - approach_offset (dx, dy, dz): vector from the target point to a safe
-    hover point before/after grasping / placing. Books sit on a shelf and
-    the bin has its own opening geometry, so these are likely different in
-    practice -- currently sharing one offset for both, revisit once
-    book_detector/bin_detector are real and we can see actual geometry.
+  - approach_offset (dx, dy, dz): vector from the grasp point to a safe
+    hover point before/after grasping. Books sit on a shelf, so this is
+    likely a horizontal standoff -- revisit once book_detector is real and
+    we can see actual geometry.
+  - place_x/y/z: hardcoded pose (planning frame) for place_in_bin, guessed
+    from navigation_node's BIN_STANDOFF (0.7m) and BOOK_APPROACH_HEAD_TILT.
+    Not measured against the actual bin model. Revisit if bin_detector ever
+    grows a point output, or once someone measures the real bin opening
+    position relative to where navigate_to_bin parks the robot.
   - request.row (GraspBook) is accepted (contract requires it) but not
     used yet -- book height comes entirely from /erc/target_book_point's
     z-coordinate. If arm_right can't reach all shelf rows once perception
@@ -93,6 +105,10 @@ class ManipulationNode(Node):
         self.declare_parameter('approach_dx', -0.15)
         self.declare_parameter('approach_dy', 0.0)
         self.declare_parameter('approach_dz', 0.0)
+        # Fixed place pose (planning frame) -- see STILL TO TUNE above.
+        self.declare_parameter('place_x', 0.6)
+        self.declare_parameter('place_y', 0.0)
+        self.declare_parameter('place_z', 0.9)
         self.declare_parameter('gripper_open', 0.04)
         self.declare_parameter('gripper_closed', 0.0)
         self.declare_parameter('position_tolerance', 0.01)
@@ -107,6 +123,11 @@ class ManipulationNode(Node):
             self.get_parameter('approach_dx').value,
             self.get_parameter('approach_dy').value,
             self.get_parameter('approach_dz').value,
+        )
+        self.place_xyz = (
+            self.get_parameter('place_x').value,
+            self.get_parameter('place_y').value,
+            self.get_parameter('place_z').value,
         )
         self.gripper_open = self.get_parameter('gripper_open').value
         self.gripper_closed = self.get_parameter('gripper_closed').value
@@ -130,13 +151,11 @@ class ManipulationNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # --- Perception input (contract: geometry_msgs/PointStamped, frame base_link) ---
+        # No equivalent subscription for the bin -- see module docstring,
+        # place_in_bin uses a fixed pose instead.
         self.latest_book_point = None
-        self.latest_bin_point = None
         self.create_subscription(
             PointStamped, '/erc/target_book_point', self._on_book_point, 10,
-            callback_group=cb_group)
-        self.create_subscription(
-            PointStamped, '/erc/collection_bin_point', self._on_bin_point, 10,
             callback_group=cb_group)
 
         # --- Manipulation service contract (state_machine_node calls these) ---
@@ -151,9 +170,6 @@ class ManipulationNode(Node):
     # ------------------------------------------------------------------
     def _on_book_point(self, msg: PointStamped):
         self.latest_book_point = msg
-
-    def _on_bin_point(self, msg: PointStamped):
-        self.latest_bin_point = msg
 
     def _wait_for_point(self, attr_name):
         deadline = time.monotonic() + self.point_wait_timeout
@@ -334,19 +350,9 @@ class ManipulationNode(Node):
         return response
 
     def _on_place_in_bin(self, request, response):
-        bin_point = self._wait_for_point('latest_bin_point')
-        if bin_point is None:
-            response.success = False
-            response.message = 'timed out waiting for /erc/collection_bin_point'
-            return response
-
-        bin_point = self.transform_to_planning_frame(bin_point)
-        if bin_point is None:
-            response.success = False
-            response.message = f'TF transform of collection_bin_point to {self.planning_frame} failed'
-            return response
-
-        bin_pose = self.point_to_pose(bin_point)
+        # Fixed pose, not a live point -- see module docstring.
+        px, py, pz = self.place_xyz
+        bin_pose = self.make_pose(px, py, pz, self.planning_frame)
         dx, dy, dz = self.approach_offset
         hover = self.offset_pose(bin_pose, dx, dy, dz)
 
