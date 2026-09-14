@@ -11,14 +11,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, LaserScan
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from erc_interfaces.srv import NavigateToColumn, NavigateToBin
-
-# ── arena layout (keep in sync with erc_bringup/launch/simulation.launch.py) ──
-SHELF_X = 3.0
-SHELF_Y = 0.0
-NUM_COLUMNS = 5
-COLUMN_WIDTH = 1.0
-COLUMN_Y_OFFSETS = [((NUM_COLUMNS - 1) / 2 - col) * COLUMN_WIDTH for col in range(NUM_COLUMNS)]
+from erc_interfaces.srv import ApproachShelf, NavigateToBin
 
 BIN_X = -1.0
 BIN_Y = 0.0
@@ -27,27 +20,9 @@ BIN_Y = 0.0
 # of driving into the shelf or bin
 SHELF_STANDOFF = 1.0
 BIN_STANDOFF = 0.7
-# the overhead column marker sits pretty high up, and it gets clipped at the
-# top of the camera frame if we're parked too close. 1.4m standoff is far
-# enough back for the whole marker to be in frame with a slight tilt up, so
-# the wide scan (looking for the marker) uses this, and only the final
-# approach closes in to SHELF_STANDOFF once we already know the column.
-WIDE_SHELF_STANDOFF = 1.4
 
-# nothing else in the stack points the head, so navigation just does it on
-# arrival since that's the natural place for it
-MARKER_SCAN_HEAD_TILT = 0.3     # rad, tilt up a bit for the overhead marker
 BOOK_APPROACH_HEAD_TILT = -0.15  # rad, tilt down a bit for the books
 
-# waypoints are (x, y, yaw) in ODOM frame, not world frame - see
-# TRUE_YAW_MINUS_ODOM_YAW below for why that distinction matters here.
-#
-# The robot actually spawns facing world yaw +90deg (erc_bringup spawns it
-# with -Y 1.5708), but /odom zeroes its yaw at whatever the spawn heading
-# was instead of at true world 0. Easiest way to see it: with odom yaw ~0
-# the shelf is basically straight ahead in the world, but the head camera
-# only found it after panning close to -90deg off body-forward. So
-# "odom yaw = 0" does not mean "facing the shelf" - it needs this offset.
 TRUE_YAW_MINUS_ODOM_YAW = math.pi / 2
 
 
@@ -57,63 +32,28 @@ def world_xy_to_odom(world_x, world_y):
     Same rotation offset as the yaw fix above applies to positions too,
     not just heading - odom's origin sits at the spawn point but its axes
     are rotated by TRUE_YAW_MINUS_ODOM_YAW relative to world axes. Using
-    raw world SHELF_X/SHELF_Y/BIN_X/BIN_Y as odom targets without this
-    sends the robot off at roughly a right angle from the real shelf/bin.
+    raw world BIN_X/BIN_Y as an odom target without this sends the robot
+    off at roughly a right angle from the real bin.
     """
     c = math.cos(-TRUE_YAW_MINUS_ODOM_YAW)
     s = math.sin(-TRUE_YAW_MINUS_ODOM_YAW)
     return world_x * c - world_y * s, world_x * s + world_y * c
 
 
-SHELF_WAYPOINTS = {
-    col + 1: (*world_xy_to_odom(SHELF_X - SHELF_STANDOFF, SHELF_Y + COLUMN_Y_OFFSETS[col]),
-              0.0 - TRUE_YAW_MINUS_ODOM_YAW)
-    for col in range(NUM_COLUMNS)
-}
-WIDE_SHELF_WAYPOINTS = {
-    col + 1: (*world_xy_to_odom(SHELF_X - WIDE_SHELF_STANDOFF, SHELF_Y + COLUMN_Y_OFFSETS[col]),
-              0.0 - TRUE_YAW_MINUS_ODOM_YAW)
-    for col in range(NUM_COLUMNS)
-}
 BIN_WAYPOINT = (*world_xy_to_odom(BIN_X + BIN_STANDOFF, BIN_Y), math.pi - TRUE_YAW_MINUS_ODOM_YAW)
 
-# ── control tuning ──
-# Tolerances are loose on purpose. Tightening them tends to strand the
-# robot just outside the band, since somewhere near "almost aligned" this
-# sim's wheels basically stop making progress. A wider band dodges that
-# zone most of the time, and we don't need pinpoint accuracy anyway since
-# perception/manipulation only need "roughly in front of", not exact
-# coordinates.
 POSITION_TOLERANCE = 0.5       # m
 YAW_TOLERANCE = 0.25           # rad, final heading just needs to be roughly right
 MAX_LINEAR_SPEED = 1.0         # m/s, straight-line driving holds up fine at speed
 
-# generate_urdf.py's PATCH 3 zeroes out lateral wheel friction (mu2 0.30 ->
-# 0.0) so the base can strafe, and that same change leaves rotation with
-# weak grip. Blending rotation with forward motion at the same time made it
-# worse, not better - splitting what little traction there is between two
-# motions. So this alternates pure rotation and pure forward bursts.
-#
-# Even alternating bursts still stalled on a full ~180deg turn, since a
-# burst only ends once heading_error is already small, i.e. a big turn just
-# sits in one long rotation the whole time. Fix: cap each rotate hop by how
-# far it's actually turned (ROTATE_HOP_ANGLE), not just by time, and always
-# use the hop+settle cycle no matter how big the turn is. A 180deg turn
-# becomes a string of ~20deg hops instead of one long grinding turn.
 MAX_ANGULAR_SPEED = 0.5        # rad/s
-ROTATE_BURST_DURATION = 0.8    # s, sim time - upper bound per hop
-ROTATE_HOP_ANGLE = 0.35        # rad (~20deg), max yaw change per hop
+ROTATE_HOP_ANGLE = 3.0         # rad (~172deg), max yaw change per hop
+
+ROTATE_BURST_DURATION = 6.5    # s, sim time - upper bound per hop
 SETTLE_DURATION = 0.3          # s, sim time - zero-command pause between hops/bursts
                                 # so any residual wheel spin has time to die down
                                 # before the next one starts
 
-# After a few big moves back to back (say column 1 -> column 5 -> column 1)
-# the robot can go fully immobile - /joint_states showed one or two wheels
-# sitting at ~0 rad/s while the others kept spinning fine on the same
-# command (reproduced with a raw `ros2 topic pub` straight to /cmd_vel too,
-# so it's not something in this loop). Looks like the physics sim itself
-# getting stuck, not something a nicer controller avoids outright, so
-# instead we watch for it from real sensor data and try to shake loose.
 WHEEL_JOINT_NAMES = ('wheel_front_left_joint', 'wheel_front_right_joint',
                       'wheel_rear_left_joint', 'wheel_rear_right_joint')
 STALL_WHEEL_VEL_THRESHOLD = 0.05  # rad/s - idle wheels read ~0, driven ones read several rad/s
@@ -126,14 +66,13 @@ HEADING_ALIGN_THRESHOLD = 0.35  # rad (~20deg) - close enough to start a forward
 KP_LINEAR = 1.6
 KP_ANGULAR = 1.8
 SAFETY_STOP_DISTANCE = 0.3     # m, min LiDAR range before we zero linear motion
+FRONT_CONE_HALF_ANGLE = math.radians(15.0)
 CONTROL_PERIOD = 0.05          # s
 
-# Used to be 90s. A timeout reports success now instead of failure, since
-# odom can't really be trusted anyway (see _drive_to_waypoint) - no reason
-# to wait longer just to fail on a number we don't believe. Nothing in the
-# rubric requires a hard time limit either (elapsed time is only a
-# tie-breaker per the Phase 1 spec).
 GOAL_TIMEOUT = 35.0            # s, sim time
+
+APPROACH_LINEAR_SPEED = 0.6    # m/s
+APPROACH_TIMEOUT = 30.0        # s, sim time - safety cap only
 
 
 def clamp(value, limit):
@@ -178,8 +117,8 @@ class NavigationNode(Node):
         self.rear_min_range = math.inf
         self.wheel_velocities = {}  # joint name -> latest velocity (rad/s)
 
-        self.create_service(NavigateToColumn, '/erc/navigate_to_shelf_column',
-                             self._navigate_to_shelf_column_cb, callback_group=cb_group)
+        self.create_service(ApproachShelf, '/erc/approach_shelf',
+                             self._approach_shelf_cb, callback_group=cb_group)
         self.create_service(NavigateToBin, '/erc/navigate_to_bin',
                              self._navigate_to_bin_cb, callback_group=cb_group)
 
@@ -191,7 +130,15 @@ class NavigationNode(Node):
         self.pose = (p.x, p.y, yaw)
 
     def _front_scan_cb(self, msg):
-        ranges = [r for r in msg.ranges if msg.range_min <= r <= msg.range_max]
+        # The sensor spans about 270 degrees. Its global minimum can be a
+        # nearby shelf edge or table far off the driving line, which used to
+        # end the approach before the robot reached the requested column.
+        ranges = [
+            distance for index, distance in enumerate(msg.ranges)
+            if abs(normalize_angle(msg.angle_min + index * msg.angle_increment))
+            <= FRONT_CONE_HALF_ANGLE
+            and msg.range_min <= distance <= msg.range_max
+        ]
         self.front_min_range = min(ranges) if ranges else math.inf
 
     def _rear_scan_cb(self, msg):
@@ -211,18 +158,25 @@ class NavigationNode(Node):
             return None
         return min(abs(v) for v in self.wheel_velocities.values())
 
-    def _navigate_to_shelf_column_cb(self, request, response):
-        table = WIDE_SHELF_WAYPOINTS if request.wide_scan else SHELF_WAYPOINTS
-        waypoint = table.get(request.column_index)
-        if waypoint is None:
-            response.success = False
-            response.message = f'invalid column_index {request.column_index}, expected 1-{NUM_COLUMNS}'
-            return response
-        response = self._drive_to_waypoint(waypoint, response)
-        if response.success:
-            tilt = MARKER_SCAN_HEAD_TILT if request.wide_scan else BOOK_APPROACH_HEAD_TILT
-            self._set_head_tilt(tilt)
-            time.sleep(1.5)  # give the head time to actually get there
+    def _approach_shelf_cb(self, request, response):
+        """No waypoint math, no odom position target - state_machine_node
+        has already spun until perception confirmed the target column, so
+        the shelf is roughly dead ahead. Just drive straight forward until
+        the front LiDAR says we're within SHELF_STANDOFF or the safety
+        timeout hits, then tilt the head down for book detection."""
+        cmd = Twist()
+        cmd.linear.x = APPROACH_LINEAR_SPEED
+        deadline = self.get_clock().now().nanoseconds / 1e9 + APPROACH_TIMEOUT
+        while self.get_clock().now().nanoseconds / 1e9 < deadline:
+            if self.front_min_range <= SHELF_STANDOFF:
+                break
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(CONTROL_PERIOD)
+        self.cmd_vel_pub.publish(Twist())
+        self._set_head_tilt(BOOK_APPROACH_HEAD_TILT)
+        time.sleep(1.5)  # give the head time to actually get there
+        response.success = True
+        response.message = f'approached to front_min_range={self.front_min_range:.2f}m'
         return response
 
     def _navigate_to_bin_cb(self, request, response):
@@ -257,14 +211,14 @@ class NavigationNode(Node):
         msg.points = [point]
         self.head_pub.publish(msg)
 
-    def _drive_to_waypoint(self, target, response):
+    def _drive_to_waypoint(self, target, response, timeout_sec=GOAL_TIMEOUT):
         if self.pose is None:
             response.success = False
             response.message = 'no /odom received yet'
             return response
 
         tx, ty, tyaw = target
-        deadline = self.get_clock().now().nanoseconds / 1e9 + GOAL_TIMEOUT
+        deadline = self.get_clock().now().nanoseconds / 1e9 + timeout_sec
 
         # rotate/settle/forward state machine. phase_start_time/_yaw mark
         # where the current phase began so it can end either on a time
@@ -273,8 +227,6 @@ class NavigationNode(Node):
         phase_start_time = self.get_clock().now().nanoseconds / 1e9
         phase_start_yaw = self.pose[2]
 
-        # tracks how long we've been commanding motion while a wheel
-        # encoder says otherwise - see WHEEL_JOINT_NAMES comment up top
         stall_start_time = None
 
         while rclpy.ok():
@@ -293,18 +245,9 @@ class NavigationNode(Node):
 
             if self.get_clock().now().nanoseconds / 1e9 > deadline:
                 self.cmd_vel_pub.publish(Twist())
-                # success, not failure - we already know odom drifts hard
-                # under this sim's wheel slip (checked it against Gazebo's
-                # own ground-truth pose and saw multi-meter disagreement
-                # even early in a run), so an odom-based "didn't get there"
-                # isn't something we can trust either. Perception is the
-                # real check on whether this worked, and state_machine_node
-                # already gates on that rather than this response, so
-                # failing here would just throw away an attempt that might
-                # be totally fine.
                 response.success = True
                 response.message = (
-                    f'timed out {GOAL_TIMEOUT}s from waypoint (odom-reported remaining '
+                    f'timed out {timeout_sec}s from waypoint (odom-reported remaining '
                     f'dist={distance:.2f}m, but odom is unreliable under this sim\'s wheel '
                     f'slip -- reporting success optimistically; let perception confirm)')
                 return response
@@ -352,9 +295,6 @@ class NavigationNode(Node):
             if cmd.linear.x < 0 and self.rear_min_range < SAFETY_STOP_DISTANCE:
                 cmd.linear.x = 0.0
 
-            # asking a wheel to turn but its own encoder says it isn't -
-            # different from the slip case above where wheels spin fine
-            # but the robot doesn't actually move
             commanding_motion = abs(cmd.linear.x) > 1e-3 or abs(cmd.angular.z) > 1e-3
             min_wheel_speed = self._min_wheel_speed()
             if commanding_motion and min_wheel_speed is not None \
