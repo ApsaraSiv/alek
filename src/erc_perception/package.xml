@@ -8,6 +8,8 @@
   <license>Apache-2.0</license>
 
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>erc_description</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
