@@ -7,6 +7,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     shelf_column_number = LaunchConfiguration('shelf_column_number')
     book_colour = LaunchConfiguration('book_colour')
+    debug_skip_to_bin = LaunchConfiguration('debug_skip_to_bin_after_column')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -15,12 +16,13 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'book_colour',
             description='Target book colour (red|blue|green|yellow), provided by the evaluator'),
+        DeclareLaunchArgument(
+            'debug_skip_to_bin_after_column', default_value='false',
+            description='Dev-only: skip SEEK_BOOK/GRASP/PLACE and drive straight to the '
+                        'bin after reaching the column, to test bin_detector standalone.'),
 
-        # Perception -- shelf_number_detector and book_color_detector are the
-        # real (erc_perception) implementations. bin_detector still points
-        # at erc_solution's empty stub since erc_perception's bin_detector.py
-        # hasn't been delivered yet -- swap this back to erc_perception once
-        # it exists.
+        # Perception -- all three (shelf_number_detector, book_color_detector,
+        # bin_detector) are the real erc_perception implementations.
         Node(
             package='erc_perception',
             executable='shelf_number_detector',
@@ -36,7 +38,7 @@ def generate_launch_description():
             parameters=[{'target_colour': book_colour}],
         ),
         Node(
-            package='erc_solution',
+            package='erc_perception',
             executable='bin_detector',
             name='bin_detector',
             output='screen',
@@ -67,6 +69,7 @@ def generate_launch_description():
             parameters=[{
                 'shelf_column_number': shelf_column_number,
                 'book_colour': book_colour,
+                'debug_skip_to_bin_after_column': debug_skip_to_bin,
             }],
         ),
     ])

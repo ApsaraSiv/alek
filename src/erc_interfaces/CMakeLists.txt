@@ -5,7 +5,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "srv/NavigateToColumn.srv"
+  "srv/ApproachShelf.srv"
   "srv/NavigateToBin.srv"
   "srv/GraspBook.srv"
   "srv/PlaceInBin.srv"

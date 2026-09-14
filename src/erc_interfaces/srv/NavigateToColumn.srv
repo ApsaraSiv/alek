@@ -1,5 +1,0 @@
-int32 column_index
-bool wide_scan false
----
-bool success
-string message
