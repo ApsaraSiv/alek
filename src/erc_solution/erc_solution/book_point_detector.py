@@ -64,6 +64,30 @@ COLOUR_RANGES = {
 
 MIN_BLOB_AREA = 200
 
+# state_machine_node centers precisely on the target column's marker (OCR,
+# CENTER_LOCK_TOLERANCE=0.06 normalized width) before approach_shelf drives
+# straight in, but the head camera's FOV is wide enough at the ~1m shelf
+# standoff to also see PART of the neighbouring columns on each side, and
+# every column has exactly one book of each colour (see
+# simulation.launch.py's per-column colour shuffle) -- so "largest blob of
+# the target colour anywhere in frame" can lock onto a neighbour column's
+# same-coloured book instead of the real target. Confirmed live: a grasp
+# that mechanically succeeded (planned, executed, closed the gripper)
+# closed on empty air because the detected point was ~0.8m off from the
+# target book's real (ground-truth) position -- consistent with a
+# neighbouring column, not sensor noise.
+#
+# Reject candidates by their back-projected METRIC lateral offset, not an
+# image-pixel fraction -- a first attempt at an image-space centered band
+# depth-dependently mis-rejected a legitimate but moderately off-center
+# detection (the true target itself, not a neighbour), freezing detection
+# for an entire grasp attempt. COLUMN_WIDTH (simulation.launch.py) is
+# 1.0m, so a neighbour column's book is at least ~0.75m away even
+# accounting for per-book placement jitter; 0.6m keeps real, moderately
+# off-center detections (observed up to ~0.4-0.55m during live runs) while
+# still excluding neighbour columns.
+MAX_LATERAL_OFFSET = 0.6  # m, from the robot's own centerline (output_frame)
+
 # Sanity bounds on the published point (output_frame, i.e. base_footprint) --
 # a bad depth/colour reading (motion blur, edge noise, a reflection) can
 # back-project to a wildly implausible position that then dooms a grasp
@@ -159,54 +183,66 @@ class BookPointDetector(Node):
         for lower, upper in COLOUR_RANGES[self.target_colour]:
             mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < MIN_BLOB_AREA:
-                continue
-            if best is None or area > best[1]:
-                best = (contour, area)
-        if best is None:
-            return
-
-        x, y, w, h = cv2.boundingRect(best[0])
-        px, py = x + w // 2, y + h // 2
-
-        if not (0 <= py < self.depth_frame.shape[0] and 0 <= px < self.depth_frame.shape[1]):
-            return
-        depth = float(self.depth_frame[py, px])
-        if not np.isfinite(depth) or depth <= 0.0:
-            return
-
-        # Pinhole back-projection: camera optical frame convention
-        # (X right, Y down, Z forward).
-        cam_x = (px - self.cx) * depth / self.fx
-        cam_y = (py - self.cy) * depth / self.fy
-        cam_z = depth
-
-        point = PointStamped()
-        point.header.stamp = msg.header.stamp
-        point.header.frame_id = self.depth_frame_id
-        point.point.x, point.point.y, point.point.z = cam_x, cam_y, cam_z
-
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.output_frame, self.depth_frame_id, rclpy.time.Time())
-            point = do_transform_point(point, transform)
         except Exception as exc:
             self.get_logger().warn(
                 f'TF transform {self.depth_frame_id} -> {self.output_frame} failed: {exc}')
             return
 
-        p = point.point
-        distance = (p.x ** 2 + p.y ** 2 + p.z ** 2) ** 0.5
-        if distance > MAX_PLAUSIBLE_DISTANCE or p.z < MIN_PLAUSIBLE_Z:
-            self.get_logger().warn(
-                f'rejecting implausible book point ({p.x:.2f}, {p.y:.2f}, {p.z:.2f}), '
-                f'distance={distance:.2f}m -- likely a bad depth/colour reading')
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Every column has exactly one book of each colour (see
+        # simulation.launch.py's per-column colour shuffle), and the camera's
+        # FOV at shelf standoff is wide enough to also catch part of the
+        # neighbouring columns -- so more than one contour here can
+        # genuinely be "a real book of this colour", just not the target
+        # column's one. Rank ALL candidates (not just the single largest
+        # blob) by back-projected metric distance from the robot's own
+        # centerline, and reject any beyond MAX_LATERAL_OFFSET -- confirmed
+        # live this must be a METRIC (not image-pixel-fraction) check: an
+        # earlier pixel-band version depth-dependently mis-rejected a
+        # legitimately off-center but genuine target detection, freezing
+        # detection entirely for the rest of a grasp attempt. Among the
+        # survivors, prefer the largest blob (most reliable colour match).
+        candidates = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < MIN_BLOB_AREA:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            px, py = x + w // 2, y + h // 2
+            if not (0 <= py < self.depth_frame.shape[0] and 0 <= px < self.depth_frame.shape[1]):
+                continue
+            depth = float(self.depth_frame[py, px])
+            if not np.isfinite(depth) or depth <= 0.0:
+                continue
+
+            # Pinhole back-projection: camera optical frame convention
+            # (X right, Y down, Z forward).
+            cam_x = (px - self.cx) * depth / self.fx
+            cam_y = (py - self.cy) * depth / self.fy
+            cam_z = depth
+
+            point = PointStamped()
+            point.header.stamp = msg.header.stamp
+            point.header.frame_id = self.depth_frame_id
+            point.point.x, point.point.y, point.point.z = cam_x, cam_y, cam_z
+            point = do_transform_point(point, transform)
+
+            p = point.point
+            distance = (p.x ** 2 + p.y ** 2 + p.z ** 2) ** 0.5
+            if distance > MAX_PLAUSIBLE_DISTANCE or p.z < MIN_PLAUSIBLE_Z:
+                continue
+            if abs(p.y) > MAX_LATERAL_OFFSET:
+                continue
+            candidates.append((area, point))
+
+        if not candidates:
             return
 
+        _, point = max(candidates, key=lambda c: c[0])
         self.point_pub.publish(point)
 
 

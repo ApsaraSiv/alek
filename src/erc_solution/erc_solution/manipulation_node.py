@@ -316,7 +316,16 @@ TORSO_LIFT_VELOCITY = 0.035  # m/s, URDF velocity limit -- used to size the wait
 # manipulation_node commands /cmd_vel directly, normally navigation_node's
 # job per INTERFACES.md -- justified because this correction is specifically
 # about making the arm's own target reachable, not general navigation.
-LATERAL_ALIGN_TOLERANCE = 0.12  # m -- how close to the book's y=0 (base-centered) counts as aligned
+# 0.12 was too tight in practice: live testing showed the proportional
+# strafe controller naturally slows as it approaches zero error (no
+# integral/minimum-speed term), and by the time it got within ~0.15m the
+# book had drifted enough toward the edge of the head camera's FOV that
+# book_point_detector lost it entirely (confirmed via a live camera-frame
+# capture -- only a sliver of the target colour remained, clipped at the
+# frame edge) before alignment could finish closing the last few
+# centimetres. Widened so alignment finishes (book still in clear view)
+# instead of chasing a tighter number the book doesn't stay visible for.
+LATERAL_ALIGN_TOLERANCE = 0.16  # m -- how close to the book's y=0 (base-centered) counts as aligned
 LATERAL_KP = 1.0
 MAX_LATERAL_SPEED = 0.15        # m/s -- slow, precise strafe, not a navigation-speed drive
 LATERAL_ALIGN_TIMEOUT = 8.0     # s
@@ -325,6 +334,11 @@ LATERAL_CONTROL_PERIOD = 0.1    # s
 # far beyond that within one cycle means a different book (see the
 # rejection comment in _align_laterally_to_book), not real tracked motion.
 MAX_PLAUSIBLE_Y_JUMP = 0.15     # m per LATERAL_CONTROL_PERIOD
+# How many consecutive disagreeing readings before accepting the new value
+# as the real reference instead of the original anchor -- see
+# _align_laterally_to_book for why this exists (a bad FIRST reading must
+# not permanently poison the rest of the alignment attempt).
+CONSECUTIVE_REJECTION_LIMIT = 5
 
 
 class ManipulationNode(Node):
@@ -590,6 +604,7 @@ class ManipulationNode(Node):
         last_y = None
         iterations = 0
         rejected = 0
+        consecutive_rejections = 0
         last_log = start
         while time.monotonic() < deadline:
             point = self.latest_book_point
@@ -614,11 +629,29 @@ class ManipulationNode(Node):
             # physically impossible for the same tracked book, so treat it
             # as a bad sample and hold the previous command rather than
             # reacting to what's very likely a different book entirely.
+            #
+            # BUT: don't anchor to a bad sample forever. Seen live: the
+            # very FIRST reading of a call (right as SEEK_BOOK's head-tilt
+            # settle hands off to GRASP) can itself be the transient/wrong
+            # one -- every subsequent (correct) reading then disagreed with
+            # that bad anchor by more than the threshold and got rejected
+            # for the entire 8s timeout, freezing first_y == last_y the
+            # whole time. A single-cycle disagreement is noise; the SAME
+            # disagreement persisting for many consecutive cycles means the
+            # anchor itself was wrong, not the new readings -- accept it as
+            # the new reference after CONSECUTIVE_REJECTION_LIMIT in a row.
             if last_y is not None and abs(y - last_y) > MAX_PLAUSIBLE_Y_JUMP:
                 rejected += 1
-                time.sleep(LATERAL_CONTROL_PERIOD)
-                continue
+                consecutive_rejections += 1
+                if consecutive_rejections < CONSECUTIVE_REJECTION_LIMIT:
+                    time.sleep(LATERAL_CONTROL_PERIOD)
+                    continue
+                self.get_logger().warn(
+                    f'lateral align: {consecutive_rejections} consecutive '
+                    f'disagreeing readings -- accepting y={y:.3f} as the new '
+                    f'reference instead of the stale anchor {last_y:.3f}')
 
+            consecutive_rejections = 0
             if first_y is None:
                 first_y = y
             last_y = y
