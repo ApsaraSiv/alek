@@ -14,6 +14,7 @@
   <depend>tf2_geometry_msgs</depend>
   <depend>moveit_msgs</depend>
   <depend>shape_msgs</depend>
+  <depend>erc_interfaces</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
