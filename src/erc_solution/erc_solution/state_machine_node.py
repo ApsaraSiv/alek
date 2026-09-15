@@ -17,14 +17,13 @@ MANIPULATION_WAIT_TIMEOUT = 3.0  # s -- shorter: manipulation_node may not exist
 ROW_WAIT_TIMEOUT = 30.0        # s
 POLL_PERIOD = 0.1               # s
 
-SPIN_ANGULAR_SPEED = -0.4      # rad/s; initial turn toward the shelf from spawn
-TRACKING_ANGULAR_SPEED = 0.12  # rad/s; correction stays below one column per OCR frame
+SPIN_ANGULAR_SPEED = -0.15     
+TRACKING_ANGULAR_SPEED = 0.25  
 SPIN_HEAD_TILT = 0.3           # rad, tilt up so the overhead marker is in frame
 SPIN_CONTROL_PERIOD = 0.05     # s
 COLUMN_ERROR_STALE_TIME = 1.0  # s, wall time; OCR is intentionally throttled
 CENTER_LOCK_TOLERANCE = 0.035  # normalized image width, matches detector's tolerance
-CENTER_SETTLE_DURATION = 0.5   # s, wall time - let residual rotation die down once
-                                # centred so two consecutive OCR frames can land there
+CENTER_SETTLE_DURATION = 0.5   # s, wall time
 SPIN_MAX_DURATION = 180.0       # s, sim time - safety cap only, not a normal stop condition
 
 
