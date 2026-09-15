@@ -34,8 +34,41 @@ BOOK_APPROACH_HEAD_TILT = -0.15  # rad, tilt down a bit for the books
 ARM_LEFT_JOINT_NAMES = (
     'arm_left_1_joint', 'arm_left_2_joint', 'arm_left_3_joint',
     'arm_left_4_joint', 'arm_left_5_joint', 'arm_left_6_joint', 'arm_left_7_joint')
-ARM_LEFT_TUCK_POSITIONS = (0.0, -1.5, 0.0, -2.0, 0.0, 0.0, 0.0)
-ARM_LEFT_TUCK_DURATION = 2.0  # s
+# PAL's own "home" motion for arm_left (tiago_pro_bringup/config/motions/
+# tiago_pro_motions_general_arm_left.yaml), same waypoints PAL uses to get
+# there without self-collision. The previous hand-picked (0,-1.5,0,-2,0,0,0)
+# left the fingertips 0.62m ahead of base_footprint -- ~0.34m past the front
+# LiDAR, so a LiDAR-based standoff still let the hand hit the shelf (seen
+# on /contacts as arm_left_6_link vs erc_shelf). /compute_fk puts this pose's
+# furthest point at x=0.34m.
+ARM_LEFT_TUCK_WAYPOINTS = (
+    ((1.8557, -1.5919, 0.35538, -2.0502, 0.10524, -1.5976, 0.0), 3),
+    ((0.26, -1.6008, 0.3489, -1.9818, 0.0, -1.2, 0.0), 6),
+    ((0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0), 9),
+)
+
+# arm_right's spawn pose also reaches 0.97m forward at shelf-bottom height,
+# so it gets PAL's mirrored home too before the drive in. manipulation_node
+# plans from wherever it's left, so this doesn't fight MoveIt.
+ARM_RIGHT_JOINT_NAMES = tuple(name.replace('left', 'right') for name in ARM_LEFT_JOINT_NAMES)
+ARM_RIGHT_TUCK_WAYPOINTS = (
+    ((-1.8614, -1.6008, -0.34892, -1.9818, 0.10153, -1.2, 0.0), 3),
+    ((-0.26, -1.6008, -0.3489, -1.9818, 0.0, -1.2, 0.0), 6),
+    ((-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0), 9),
+)
+
+# In Gazebo the arms settle ~0.1-0.15 rad short of PAL's home on joints 2/4
+# (pressed against the torso), which still leaves both hands within ~0.4m
+# of base_footprint -- close enough. The 9s trajectory is in sim time, and
+# the sim runs well under real time here, so the wall-clock wait is generous.
+# PAL's home torso height -- at 0.0 the tucked arms press into base_link
+# (MoveIt's /check_state_validity agrees), so raise to this before tucking.
+TORSO_HOME = 0.10          # m
+TORSO_TOLERANCE = 0.01     # m
+TORSO_TIMEOUT = 60.0       # s, wall time; the sim torso tracks slowly
+
+ARM_TUCK_TOLERANCE = 0.2   # rad, per joint
+ARM_TUCK_TIMEOUT = 60.0    # s, wall time
 
 TRUE_YAW_MINUS_ODOM_YAW = math.pi / 2
 
@@ -123,6 +156,10 @@ class NavigationNode(Node):
             JointTrajectory, '/head_controller/joint_trajectory', 10)
         self.arm_left_pub = self.create_publisher(
             JointTrajectory, '/arm_left_controller/joint_trajectory', 10)
+        self.arm_right_pub = self.create_publisher(
+            JointTrajectory, '/arm_right_controller/joint_trajectory', 10)
+        self.torso_pub = self.create_publisher(
+            JointTrajectory, '/torso_controller/joint_trajectory', 10)
         self.create_subscription(Odometry, '/odom', self._odom_cb, 10, callback_group=cb_group)
         self.create_subscription(LaserScan, '/scan_front_raw', self._front_scan_cb, 10, callback_group=cb_group)
         self.create_subscription(LaserScan, '/scan_rear_raw', self._rear_scan_cb, 10, callback_group=cb_group)
@@ -132,6 +169,7 @@ class NavigationNode(Node):
         self.front_min_range = math.inf
         self.rear_min_range = math.inf
         self.wheel_velocities = {}  # joint name -> latest velocity (rad/s)
+        self.arm_positions = {}  # arm joint name -> latest position (rad)
 
         self.create_service(ApproachShelf, '/erc/approach_shelf',
                              self._approach_shelf_cb, callback_group=cb_group)
@@ -165,6 +203,9 @@ class NavigationNode(Node):
         for name in WHEEL_JOINT_NAMES:
             if name in msg.name:
                 self.wheel_velocities[name] = msg.velocity[msg.name.index(name)]
+        for name in ARM_LEFT_JOINT_NAMES + ARM_RIGHT_JOINT_NAMES + ('torso_lift_joint',):
+            if name in msg.name:
+                self.arm_positions[name] = msg.position[msg.name.index(name)]
 
     def _min_wheel_speed(self):
         """Slowest wheel right now, or None until we've heard from all 4.
@@ -180,6 +221,13 @@ class NavigationNode(Node):
         the shelf is roughly dead ahead. Just drive straight forward until
         the front LiDAR says we're within SHELF_STANDOFF or the safety
         timeout hits, then tilt the head down for book detection."""
+        # Tuck before driving in, not after -- the arm has to be clear while
+        # the base closes the gap, or it's the thing that hits the shelf.
+        if not self._tuck_arms():
+            response.success = False
+            response.message = 'arms did not reach the tuck pose'
+            return response
+
         cmd = Twist()
         cmd.linear.x = APPROACH_LINEAR_SPEED
         deadline = self.get_clock().now().nanoseconds / 1e9 + APPROACH_TIMEOUT
@@ -190,8 +238,7 @@ class NavigationNode(Node):
             time.sleep(CONTROL_PERIOD)
         self.cmd_vel_pub.publish(Twist())
         self._set_head_tilt(BOOK_APPROACH_HEAD_TILT)
-        self._tuck_arm_left()
-        time.sleep(1.5)  # give the head/arm time to actually get there
+        time.sleep(1.5)  # give the head time to actually get there
         response.success = True
         response.message = f'approached to front_min_range={self.front_min_range:.2f}m'
         return response
@@ -228,16 +275,63 @@ class NavigationNode(Node):
         msg.points = [point]
         self.head_pub.publish(msg)
 
-    def _tuck_arm_left(self):
-        """Fold the unused left arm down alongside the torso -- see
-        ARM_LEFT_TUCK_POSITIONS above for why this runs at all."""
+    def _arm_at(self, joint_names, positions):
+        return all(
+            name in self.arm_positions
+            and abs(self.arm_positions[name] - target) <= ARM_TUCK_TOLERANCE
+            for name, target in zip(joint_names, positions))
+
+    def _set_torso_home(self):
+        def at_home():
+            pos = self.arm_positions.get('torso_lift_joint')
+            return pos is not None and abs(pos - TORSO_HOME) <= TORSO_TOLERANCE
+        if at_home():
+            return True
         msg = JointTrajectory()
-        msg.joint_names = list(ARM_LEFT_JOINT_NAMES)
+        msg.joint_names = ['torso_lift_joint']
         point = JointTrajectoryPoint()
-        point.positions = list(ARM_LEFT_TUCK_POSITIONS)
-        point.time_from_start.sec = int(ARM_LEFT_TUCK_DURATION)
+        point.positions = [TORSO_HOME]
+        point.time_from_start.sec = 5
         msg.points = [point]
-        self.arm_left_pub.publish(msg)
+        self.torso_pub.publish(msg)
+        deadline = time.monotonic() + TORSO_TIMEOUT
+        while time.monotonic() < deadline:
+            if at_home():
+                return True
+            time.sleep(0.2)
+        self.get_logger().warn(
+            f'torso not at {TORSO_HOME}m after {TORSO_TIMEOUT}s: {self.arm_positions.get("torso_lift_joint")}')
+        return False
+
+    def _tuck_arms(self):
+        """Fold both arms into PAL's home poses -- see ARM_*_TUCK_WAYPOINTS
+        above. Blocks until /joint_states confirms both got there."""
+        if not self._set_torso_home():
+            return False
+        arms = (
+            (self.arm_left_pub, ARM_LEFT_JOINT_NAMES, ARM_LEFT_TUCK_WAYPOINTS),
+            (self.arm_right_pub, ARM_RIGHT_JOINT_NAMES, ARM_RIGHT_TUCK_WAYPOINTS),
+        )
+        pending = []
+        for pub, names, waypoints in arms:
+            if self._arm_at(names, waypoints[-1][0]):
+                continue
+            msg = JointTrajectory()
+            msg.joint_names = list(names)
+            for positions, t in waypoints:
+                point = JointTrajectoryPoint()
+                point.positions = list(positions)
+                point.time_from_start.sec = t
+                msg.points.append(point)
+            pub.publish(msg)
+            pending.append((names, waypoints[-1][0]))
+        deadline = time.monotonic() + ARM_TUCK_TIMEOUT
+        while time.monotonic() < deadline:
+            if all(self._arm_at(names, target) for names, target in pending):
+                return True
+            time.sleep(0.2)
+        self.get_logger().warn(f'arms not tucked after {ARM_TUCK_TIMEOUT}s: {self.arm_positions}')
+        return False
 
     def _drive_to_waypoint(self, target, response, timeout_sec=GOAL_TIMEOUT):
         if self.pose is None:
