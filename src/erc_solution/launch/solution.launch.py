@@ -56,13 +56,14 @@ def generate_launch_description():
         ),
         # book_color_detector only publishes shelf_row_identification, not a
         # 3D point -- this fills the /erc/target_book_point gap manipulation
-        # needs. Was missing from this launch file entirely. PLACEHOLDER
-        # point, not real detection (see book_detector.py).
+        # needs, by back-projecting the same colour-blob detection through
+        # the depth camera (see book_detector.py).
         Node(
             package='erc_solution',
             executable='book_detector',
             name='book_detector',
             output='screen',
+            parameters=[{'target_book_colour': book_colour}],
         ),
 
         # Navigation
