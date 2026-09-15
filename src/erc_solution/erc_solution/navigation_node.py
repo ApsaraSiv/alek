@@ -23,6 +23,20 @@ BIN_STANDOFF = 0.7
 
 BOOK_APPROACH_HEAD_TILT = -0.15  # rad, tilt down a bit for the books
 
+# Only arm_right is in the MoveIt planning group (see tiago_pro.srdf) --
+# arm_left has no group, so it can't be planned around and just sits in
+# whatever pose it was left in. At spawn/zero that's stretched out to the
+# side, which both juts into the shelf approach and can clip the head
+# camera's view of the books. Tuck it down alongside the torso (elbow
+# bent, forearm roughly vertical) before the right arm goes to work, so
+# it's physically out of the way instead of relying on MoveIt collision
+# checking to route around it.
+ARM_LEFT_JOINT_NAMES = (
+    'arm_left_1_joint', 'arm_left_2_joint', 'arm_left_3_joint',
+    'arm_left_4_joint', 'arm_left_5_joint', 'arm_left_6_joint', 'arm_left_7_joint')
+ARM_LEFT_TUCK_POSITIONS = (0.0, -1.5, 0.0, -2.0, 0.0, 0.0, 0.0)
+ARM_LEFT_TUCK_DURATION = 2.0  # s
+
 TRUE_YAW_MINUS_ODOM_YAW = math.pi / 2
 
 
@@ -107,6 +121,8 @@ class NavigationNode(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.head_pub = self.create_publisher(
             JointTrajectory, '/head_controller/joint_trajectory', 10)
+        self.arm_left_pub = self.create_publisher(
+            JointTrajectory, '/arm_left_controller/joint_trajectory', 10)
         self.create_subscription(Odometry, '/odom', self._odom_cb, 10, callback_group=cb_group)
         self.create_subscription(LaserScan, '/scan_front_raw', self._front_scan_cb, 10, callback_group=cb_group)
         self.create_subscription(LaserScan, '/scan_rear_raw', self._rear_scan_cb, 10, callback_group=cb_group)
@@ -174,7 +190,8 @@ class NavigationNode(Node):
             time.sleep(CONTROL_PERIOD)
         self.cmd_vel_pub.publish(Twist())
         self._set_head_tilt(BOOK_APPROACH_HEAD_TILT)
-        time.sleep(1.5)  # give the head time to actually get there
+        self._tuck_arm_left()
+        time.sleep(1.5)  # give the head/arm time to actually get there
         response.success = True
         response.message = f'approached to front_min_range={self.front_min_range:.2f}m'
         return response
@@ -210,6 +227,17 @@ class NavigationNode(Node):
         point.time_from_start.sec = 1
         msg.points = [point]
         self.head_pub.publish(msg)
+
+    def _tuck_arm_left(self):
+        """Fold the unused left arm down alongside the torso -- see
+        ARM_LEFT_TUCK_POSITIONS above for why this runs at all."""
+        msg = JointTrajectory()
+        msg.joint_names = list(ARM_LEFT_JOINT_NAMES)
+        point = JointTrajectoryPoint()
+        point.positions = list(ARM_LEFT_TUCK_POSITIONS)
+        point.time_from_start.sec = int(ARM_LEFT_TUCK_DURATION)
+        msg.points = [point]
+        self.arm_left_pub.publish(msg)
 
     def _drive_to_waypoint(self, target, response, timeout_sec=GOAL_TIMEOUT):
         if self.pose is None:

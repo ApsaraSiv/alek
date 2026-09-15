@@ -71,7 +71,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
 
-from geometry_msgs.msg import PointStamped, PoseStamped, Vector3
+from geometry_msgs.msg import PointStamped, PoseStamped, Vector3, Twist
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from shape_msgs.msg import SolidPrimitive
 
@@ -86,10 +86,26 @@ from moveit_msgs.msg import (
 
 from erc_interfaces.srv import GraspBook, PlaceInBin
 
+import math
 import tf2_ros
 from tf2_geometry_msgs import do_transform_point
 
 MOVEIT_SUCCESS = 1  # moveit_msgs/msg/MoveItErrorCodes.SUCCESS
+
+# arm_right is mounted on the right side of the torso -- /compute_ik testing
+# in Gazebo shows it can only reach roughly up to y=0.15m to the *left* of
+# base_footprint (past that IK returns NO_IK_SOLUTION even with a wide-open
+# orientation tolerance). book_detector's point is wherever the book actually
+# sits in its shelf slot, which is often well past that, so grasp planning
+# would just fail outright with "unable to sample any valid states for goal
+# tree." Rotate the base to bring the book onto the arm's forward axis first.
+MAX_REACHABLE_ABS_Y = 0.15      # m, planning-frame y, see above
+CENTERING_ANGULAR_SPEED = 0.3   # rad/s
+CENTERING_SETTLE_SEC = 1.0      # s, let the wheels stop and a fresh point arrive
+
+
+def clamp_angle(angle, limit):
+    return math.copysign(min(abs(angle), limit), angle) if angle else 0.0
 
 
 class ManipulationNode(Node):
@@ -148,6 +164,7 @@ class ManipulationNode(Node):
         # has no subscriber, so publishing there silently does nothing.
         self.gripper_pub = self.create_publisher(
             JointTrajectory, '/gripper_right_controller_raw/joint_trajectory', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # --- TF for transforming perception output into the planning frame ---
         self.tf_buffer = tf2_ros.Buffer()
@@ -223,6 +240,53 @@ class ManipulationNode(Node):
             pose_stamped.pose.orientation.z,
             pose_stamped.pose.orientation.w,
         )
+
+    def _rotate_base(self, angle_rad):
+        cmd = Twist()
+        cmd.angular.z = math.copysign(CENTERING_ANGULAR_SPEED, angle_rad)
+        duration = abs(angle_rad) / CENTERING_ANGULAR_SPEED
+        end_time = time.monotonic() + duration
+        while time.monotonic() < end_time:
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(0.05)
+        self.cmd_vel_pub.publish(Twist())
+
+    def _center_on_book(self, book_pose: PoseStamped, max_attempts=5):
+        """Rotate the base so the book point lands on arm_right's forward
+        reach axis (small |y| in the planning frame) instead of off to the
+        side where no IK solution exists. Open-loop (no odom feedback,
+        just the known bearing angle in the base-fixed planning frame),
+        re-checked against a fresh book point after each turn since the
+        blob's apparent position shifts as the base rotates."""
+        for attempt in range(max_attempts):
+            x = book_pose.pose.position.x
+            y = book_pose.pose.position.y
+            bearing = math.atan2(y, x)
+            # Clamp the turn: a full-bearing rotation in one shot can swing
+            # the camera past this book's column onto a neighbouring one
+            # (each column can have its own book of the same target colour),
+            # which showed up as the tracked point suddenly jumping to a
+            # wildly different offset instead of converging. Small steps
+            # keep the same book in frame across attempts.
+            bearing = clamp_angle(bearing, math.radians(15.0))
+            self.get_logger().info(
+                f'book at y={y:.2f}m (> {MAX_REACHABLE_ABS_Y}m reach limit) -- '
+                f'rotating base {math.degrees(bearing):.1f} deg to center it (attempt {attempt + 1})')
+            self._rotate_base(bearing)
+            time.sleep(CENTERING_SETTLE_SEC)
+
+            self.latest_book_point = None
+            fresh_point = self._wait_for_point('latest_book_point')
+            if fresh_point is None:
+                self.get_logger().warn('no fresh target_book_point after centering turn')
+                return None
+            fresh_point = self.transform_to_planning_frame(fresh_point)
+            if fresh_point is None:
+                return None
+            book_pose = self.point_to_pose(fresh_point)
+            if abs(book_pose.pose.position.y) <= MAX_REACHABLE_ABS_Y:
+                return book_pose
+        return None
 
     # ------------------------------------------------------------------
     def pose_to_constraints(self, pose_stamped: PoseStamped, link_name: str) -> Constraints:
@@ -330,6 +394,15 @@ class ManipulationNode(Node):
             return response
 
         book_pose = self.point_to_pose(book_point)
+
+        if abs(book_pose.pose.position.y) > MAX_REACHABLE_ABS_Y:
+            book_pose = self._center_on_book(book_pose)
+            if book_pose is None:
+                response.success = False
+                response.message = (
+                    'book stayed out of arm_right reach after centering the base on it')
+                return response
+
         dx, dy, dz = self.approach_offset
         pregrasp = self.offset_pose(book_pose, dx, dy, dz)
 
