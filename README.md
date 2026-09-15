@@ -1,241 +1,205 @@
-### Updates 11/09/26
-- Competition Rules Update: Book spine width reduced from **3cm to 2cm**. Please update parameters accordingly.
-- Manipulation: A possible workaround to issue [#2](https://github.com/dfl-rlab/erc_sim_2026/issues/2) is using the position controller and the effort interface feedback from the gripper to keep publishing position in a closed-loop. This produces the following video:
+# Team Aleksandria — Emirates Robotics Competition 2026, Phase 1
 
-[tiago_pro_book_grip_test.webm](https://github.com/user-attachments/assets/90e8d60b-9724-4ee1-ae07-955a705a5bdf)
+Autonomous library-assistant solution for the ERC 2026 Simulation Phase: a
+TIAGo Pro finds the requested shelf column by reading its overhead number,
+identifies the requested book colour, picks the book with **one arm (right)**,
+brings it back and places it in the red collection bin.
 
-
-# Emirates Robotics Competition 2026
-
-Library Assistant Robot challenge: Autonomous book retrieval using a TIAGo Pro mobile manipulator.
+This repository is based on the official competition environment,
+[dfl-rlab/erc_sim_2026](https://github.com/dfl-rlab/erc_sim_2026), and keeps
+its Docker image, simulation packages and robot description unchanged. The
+team's own work is in the packages listed under
+[Packages created by the team](#packages-created-by-the-team).
 
 <img src="docs/assets/erc_3d_env.png" width="300"/> <img src="docs/assets/tiago_pro.png" width="200"/>
 
-## Prerequisites
+---
 
-- x86_64 (amd64) architecture. ARM-based hosts (e.g. Apple Silicon) are not supported
+## Running a challenge trial
+
+The evaluation command from the Phase 1 rules is supported as-is. The base
+simulation must be running before the solution is launched.
+
+```bash
+# Terminal 1 — inside the container
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch erc_bringup simulation.launch.py
+```
+
+Wait until the robot, shelves and books have spawned (controllers come up
+about 8 s after Gazebo starts), then:
+
+```bash
+# Terminal 2 — inside the container (./docker/attach.sh from the host)
+source install/setup.bash
+ros2 launch erc_solution solution.launch.py shelf_column_number:=2 book_colour:=red
+```
+
+| Argument | Values | Meaning |
+|---|---|---|
+| `shelf_column_number` | `1`–`5` | Number on the overhead marker of the target column. Markers are shuffled on every simulation load, so the column is found by vision, not by position. |
+| `book_colour` | `red`, `blue`, `green`, `yellow` | Colour of the target book in that column. |
+| `debug_skip_to_bin_after_column` | `false` (default) | Development only: after reaching the column, skip grasping and drive straight to the bin. |
+
+`solution.launch.py` starts every node the solution needs, including MoveIt
+(`move_group`) for the right arm.
+
+## What the solution does
+
+`state_machine_node` runs the trial as a fixed sequence of states:
+
+| State | What happens | Main nodes |
+|---|---|---|
+| `SEEK_COLUMN` | Turns in short steps with the head tilted up until the target number is read on an overhead marker, then turns to centre it in the camera. Backs away if it drifts too close to a wall. | `shelf_number_detector`, `state_machine_node` |
+| approach (`/erc/approach_shelf`) | Tucks both arms into PAL's home pose, then drives forward until the front LiDAR reports the shelf standoff distance. | `navigation_node` |
+| `SEEK_BOOK` | Detects the target colour in the camera and reports its row (1–4). | `book_color_detector`, `book_detector` |
+| `GRASP` (`/erc/grasp_book`) | Back-projects the book through the depth camera, centres the base on it if it is out of reach, raises the torso for high rows, and moves the right gripper straight in with a forward-pointing orientation. Closes slowly, lifts, and pulls the book out. | `book_detector`, `manipulation_node`, `move_group` |
+| `NAV_TO_BIN` (`/erc/navigate_to_bin`) | Drives back towards the start zone to a standoff in front of the bin. | `navigation_node` |
+| `PLACE` (`/erc/place_in_bin`) | Measures the bin rim and table from the camera, lifts the book above the rim before closing in, releases over the bin, backs off and returns the arm to its home pose. | `manipulation_node`, `move_group` |
+
+If any step fails, the state machine logs `state=FAILED` with the reason and
+does not start the remaining steps.
+
+## Competition outputs
+
+| Requirement (Phase 1 rules) | Where it comes from |
+|---|---|
+| `/erc/shelf_column_identification` — `std_msgs/msg/Int32`, column number | `shelf_number_detector`, once the target number has been centred in two consecutive frames |
+| `/erc/shelf_row_identification` — `std_msgs/msg/Int32`, row 1–4 | `book_color_detector` (and `book_detector`) when the target book is visible |
+| Annotated, timestamped images of the target column and target book | `shelf_number_detector` (`shelf_*.png`) and `book_color_detector` (`books_*.png`), saved from the live camera during the trial |
+| Book placed in the bin | Contact reported on `/bin_contacts` |
+
+## Packages created by the team
+
+| Package | Type | Contents |
+|---|---|---|
+| [`erc_solution`](src/erc_solution) | `ament_python` | The solution package: `solution.launch.py`, `state_machine_node`, `navigation_node`, `manipulation_node`, `book_detector`. See also [`INTERFACES.md`](src/erc_solution/INTERFACES.md). |
+| [`erc_perception`](src/erc_perception) | `ament_python` | Camera-based detectors: `shelf_number_detector`, `book_color_detector`, `bin_detector`. |
+| [`erc_interfaces`](src/erc_interfaces) | `ament_cmake` | Service definitions used between the state machine, navigation and manipulation: `ApproachShelf`, `NavigateToBin`, `GraspBook`, `PlaceInBin`. |
+| [`tiago_pro_right_arm_moveit_config`](src/tiago_pro_right_arm_moveit_config) | MoveIt config | MoveIt Setup Assistant configuration for the `arm_right` planning group, started by `solution.launch.py`. |
+| [`tools/drift_viz`](tools/drift_viz) | Scripts (not a ROS package) | Development tool: overlays planned waypoints, `/odom` and Gazebo ground truth in RViz (`drift_viz.py` + `drift_viz.rviz`), or renders the same view to PNG (`render_drift.py`). |
+
+`src/aleksandria` is an early standalone arm prototype kept for reference; it
+is not launched by the solution.
+
+### Nodes
+
+| Node | Package | Subscribes | Publishes / provides |
+|---|---|---|---|
+| `shelf_number_detector` | `erc_perception` | colour image | `/erc/shelf_column_identification`, `/erc/shelf_column_horizontal_error`, annotated images |
+| `book_color_detector` | `erc_perception` | colour image | `/erc/shelf_row_identification`, annotated images |
+| `bin_detector` | `erc_perception` | colour image | `/erc/bin_identification` (`std_msgs/Bool`; not currently used by the solution) |
+| `book_detector` | `erc_solution` | colour and depth images, camera info, `/scan_front_raw` | `/erc/target_book_point` (`geometry_msgs/PointStamped`), `/erc/shelf_row_identification` |
+| `state_machine_node` | `erc_solution` | column identification and horizontal error, row identification, `/scan_front_raw` | `/cmd_vel` and head commands during the column search; calls the four `/erc/*` services |
+| `navigation_node` | `erc_solution` | `/odom`, `/scan_front_raw`, `/scan_rear_raw`, `/joint_states` | `/cmd_vel`; arm, torso and head trajectories (arm tuck); services `/erc/approach_shelf`, `/erc/navigate_to_bin` |
+| `manipulation_node` | `erc_solution` | `/erc/target_book_point`, camera images, `/joint_states`, `/odom`, `/scan_front_raw` | `move_group` actions/services (`/move_action`, `/compute_cartesian_path`, `/execute_trajectory`); gripper, torso and head trajectories; `/cmd_vel` for base centring; services `/erc/grasp_book`, `/erc/place_in_bin` |
+
+Dependencies of each package are declared in its `package.xml`.
+
+---
+
+## Environment setup
+
+These steps are unchanged from the official
+[erc_sim_2026 README](https://github.com/dfl-rlab/erc_sim_2026#quick-start).
+
+### Prerequisites
+
+- x86_64 (amd64) architecture — ARM hosts (e.g. Apple Silicon) are not supported
 - Linux host (Ubuntu 22.04/24.04 recommended) with X11
 - Docker Engine + Docker Compose v2
 - Git
-- NVIDIA GPU + nvidia-container-toolkit for GPU-accelerated rendering        # Rendering is slow but possible without NVIDIA GPU
-- ~15GB free disk space
+- NVIDIA GPU + nvidia-container-toolkit for GPU-accelerated rendering (works without one, but Gazebo runs slowly)
+- ~15 GB free disk space
 
-**Note:** The default `ROS_DOMAIN_ID` is `23`. If you are running multiple ROS 2 environments on the same network, ensure there are no domain ID conflicts.
+The default `ROS_DOMAIN_ID` is `23`. If several ROS 2 environments share the
+network, make sure the domain IDs don't clash.
 
-## Quick start
+### Quick start
 
-All dependencies are vendored in this repository — there is no separate dependency-fetching step, and no network access is needed after cloning.
+All dependencies are vendored in this repository, so no network access is
+needed after cloning.
 
 ```bash
-# — Host terminal —
-./docker/up.sh --build                        # Build image & start container
-./docker/attach.sh                            # Open shell inside container
+# — Host terminal, repository root —
+./docker/up.sh --build          # build the image and start the container
+./docker/attach.sh              # open a shell inside the container
 
-# — Inside container (after attach) —
-colcon build --symlink-install                # Build workspace packages (first run takes several minutes)
-source install/setup.bash                     # Source the workspace
-ros2 launch erc_bringup simulation.launch.py  # Launch Gazebo + robot
+# — Inside the container —
+colcon build --symlink-install  # first build takes several minutes
+source install/setup.bash
+ros2 launch erc_bringup simulation.launch.py
 ```
 
-To open additional terminals into the running container:
-```bash
-# — Host terminal —                           # Navigate to the repository root (where "docker/", "src/", and "docs/" are located)
-./docker/attach.sh                            # Do NOT run ./docker/up.sh again as this will kill your running container
-```
+For more terminals, run `./docker/attach.sh` again from the repository root.
+**Do not run `./docker/up.sh` again** — it restarts the running container.
 
-The video below is a visual guide for the above steps.
-
-
-https://github.com/user-attachments/assets/d7214b5d-6c78-47a6-9edf-944c4bd270d3
-
-
-## Robot platform
-
-TIAGo Pro by PAL Robotics — omnidirectional mobile manipulator.
-
-**Hardware in simulation:**
-- Omnidirectional mecanum base (4 mecanum wheels, full holonomic motion)
-- Two 7-DOF arms (left and right) with PAL Pro grippers
-- Pan-tilt head (2 DOF)
-- Prismatic torso lift
-- Intel RealSense D435i RGB-D camera (head-mounted)
-- Two 270° LiDARs (front and rear, base-mounted)
-- IMU (base)
-
-## ROS 2 topics and controllers
-
-### Mobile base
-
-The base is driven by the Gazebo MecanumDrive plugin. Publish a standard `Twist` message to move the robot in any direction.
-
-| Topic | Type | Direction | Description |
-|---|---|---|---|
-| `/cmd_vel` | `geometry_msgs/Twist` | Subscriber | Base velocity (linear.x, linear.y, angular.z) |
-| `/odom` | `nav_msgs/Odometry` | Publisher | Wheel odometry |
-
-**Examples:**
-```bash
-# Drive forward
-ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.3, y: 0.0}, angular: {z: 0.0}}" --rate 10
-
-# Strafe left
-ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.3}, angular: {z: 0.0}}" --rate 10
-
-# Rotate in place
-ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0}, angular: {z: 0.5}}" --rate 10
-
-# Diagonal movement (forward + left)
-ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.3, y: 0.3}, angular: {z: 0.0}}" --rate 10
-```
-
-### Joint controllers
-
-All joint controllers use `joint_trajectory_controller/JointTrajectoryController` via `ros2_control`. Send trajectories using the action interface or the topic shortcut.
-
-| Controller | Topic | Joints |
-|---|---|---|
-| `arm_left_controller` | `/arm_left_controller/joint_trajectory` | `arm_left_1_joint` .. `arm_left_7_joint` |
-| `arm_right_controller` | `/arm_right_controller/joint_trajectory` | `arm_right_1_joint` .. `arm_right_7_joint` |
-| `gripper_left_controller_raw` | `/gripper_left_controller_raw/joint_trajectory` | `gripper_left_finger_joint` |
-| `gripper_right_controller_raw` | `/gripper_right_controller_raw/joint_trajectory` | `gripper_right_finger_joint` |
-| `head_controller` | `/head_controller/joint_trajectory` | `head_1_joint`, `head_2_joint` |
-| `torso_controller` | `/torso_controller/joint_trajectory` | `torso_lift_joint` |
-| `joint_state_broadcaster` | `/joint_states` | All joints (read-only) |
-
-**Examples:**
-```bash
-# — Left arm: move joint 1 to 0.5 rad —
-ros2 topic pub --once /arm_left_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [arm_left_1_joint, arm_left_2_joint, arm_left_3_joint, arm_left_4_joint, \
-  arm_left_5_joint, arm_left_6_joint, arm_left_7_joint], \
-  points: [{positions: [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], time_from_start: {sec: 2}}]}"
-
-# — Right arm: move joint 1 to -0.5 rad —
-ros2 topic pub --once /arm_right_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [arm_right_1_joint, arm_right_2_joint, arm_right_3_joint, arm_right_4_joint, \
-  arm_right_5_joint, arm_right_6_joint, arm_right_7_joint], \
-  points: [{positions: [-0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], time_from_start: {sec: 2}}]}"
-
-# — Left gripper: close (0.0 = closed, 0.04 = open) —
-ros2 topic pub --once /gripper_left_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [gripper_left_finger_joint], \
-  points: [{positions: [0.0], time_from_start: {sec: 1}}]}"
-
-# — Left gripper: open —
-ros2 topic pub --once /gripper_left_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [gripper_left_finger_joint], \
-  points: [{positions: [0.04], time_from_start: {sec: 1}}]}"
-
-# — Right gripper: close —
-ros2 topic pub --once /gripper_right_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [gripper_right_finger_joint], \
-  points: [{positions: [0.0], time_from_start: {sec: 1}}]}"
-
-# — Right gripper: open —
-ros2 topic pub --once /gripper_right_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [gripper_right_finger_joint], \
-  points: [{positions: [0.04], time_from_start: {sec: 1}}]}"
-
-# — Head: pan left 0.5 rad, tilt down 0.3 rad —
-ros2 topic pub --once /head_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [head_1_joint, head_2_joint], \
-  points: [{positions: [0.5, -0.3], time_from_start: {sec: 1}}]}"
-
-# — Torso: raise to 0.3 m —
-ros2 topic pub --once /torso_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
-  "{joint_names: [torso_lift_joint], \
-  points: [{positions: [0.3], time_from_start: {sec: 2}}]}"
-```
-
-### Sensors
-
-| Topic | Type | Description |
-|---|---|---|
-| `/scan_front_raw` | `sensor_msgs/msg/LaserScan` | Front LiDAR |
-| `/scan_rear_raw` | `sensor_msgs/msg/LaserScan` | Rear LiDAR |
-| `/head_front_camera/head_front_camera/color/image_raw` | `sensor_msgs/msg/Image` | Head RGB camera |
-| `/head_front_camera/head_front_camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` | Head RGB camera info |
-| `/head_front_camera/head_front_camera/depth/image_rect_raw` | `sensor_msgs/msg/Image` | Head depth camera (float32) |
-| `/head_front_camera/head_front_camera/depth/camera_info` | `sensor_msgs/msg/CameraInfo` | Head depth camera info |
-| `/head_front_camera/head_front_camera/depth/color/points` | `sensor_msgs/msg/PointCloud2` | |
-| `/base_imu` | `sensor_msgs/msg/Imu` | Base IMU |
-| `/contacts` | `ros_gz_interfaces/msg/Contacts` | Contact sensor |
-| `/bin_contacts` | `ros_gz_interfaces/msg/Contacts` | |
-
-### Sensor specifications
-
-| Sensor | Parameter | Value |
-|---|---|---|
-| **Head RGB camera** | Resolution | 640 × 360 px |
-| | Horizontal FOV | 1.518 rad (87°) |
-| | Vertical FOV | 0.977 rad (56°) |
-| | Update rate | 30 Hz |
-| **Head depth camera** | Resolution | 640 × 360 px |
-| | Depth range | 0.2 – 8.0 m |
-| | Update rate | 30 Hz |
-| **Front / Rear LiDAR** | Model | SICK TIM551 (gpu_lidar) |
-| | FOV | ~270° |
-| | Range | 0.05 – 25.0 m |
-| | Samples | 818 (0.33°/step) |
-| | Update rate | 10 Hz |
-| **Base IMU** | Update rate | 100 Hz |
-
-
-## Software stack
+### Software stack
 
 | Component | Version |
 |---|---|
 | ROS 2 | Humble |
 | Gazebo | Harmonic |
-| Physics engine | DART |
 | DDS | CycloneDDS |
-| Robot description | PAL Robotics (vendored, see above) |
-| Controller framework | ros2_control + gz_ros2_control |
+| Controllers | ros2_control + gz_ros2_control |
+| Motion planning | MoveIt 2 |
 
-## Vendored dependencies
+The Docker image, OS, ROS 2 distribution, Gazebo version and robot model are
+used exactly as provided, as the Phase 1 rules require.
 
-| Package | Upstream | Branch |
-|---|---|---|
-| `launch_pal` | https://github.com/pal-robotics/launch_pal | `master` |
-| `pal_urdf_utils` | https://github.com/pal-robotics/pal_urdf_utils | `humble-devel` |
-| `pal_gripper` | https://github.com/pal-robotics/pal_gripper | `humble-devel` |
-| `pal_pro_gripper` | https://github.com/pal-robotics/pal_pro_gripper | `humble-devel` |
-| `tiago_pro_robot` | https://github.com/pal-robotics/tiago_pro_robot | `humble-devel` |
-| `pal_sea_arm` | https://github.com/pal-robotics/pal_sea_arm | `humble-devel` |
-| `tiago_pro_head_robot` | https://github.com/pal-robotics/tiago_pro_head_robot | `humble-devel` |
-| `omni_base_robot` | https://github.com/pal-robotics/omni_base_robot | `humble-devel` |
-| `gz_ros2_control` | https://github.com/ros-controls/gz_ros2_control | `humble` |
+## Robot interfaces used
 
-## URDF generation
+| Interface | Topic / controller |
+|---|---|
+| Base velocity | `/cmd_vel` (`geometry_msgs/Twist`, mecanum drive) |
+| Odometry | `/odom` |
+| LiDARs | `/scan_front_raw`, `/scan_rear_raw` |
+| Head camera | `/head_front_camera/head_front_camera/color/image_raw`, `.../depth/image_rect_raw`, `.../color/camera_info`, `.../depth/camera_info` |
+| Right arm | `arm_right_controller` (driven through MoveIt) |
+| Right gripper | `/gripper_right_controller_raw/joint_trajectory` (`gripper_right_finger_joint`: 0.0 closed, ~0.065 fully open) |
+| Left arm | `arm_left_controller` — only used to tuck it out of the way |
+| Torso / head | `torso_controller`, `head_controller` |
+| Bin contact | `/bin_contacts` |
 
-The robot URDF is generated from PAL's xacro sources with Gazebo Harmonic patches applied and saved to `src/erc_description/urdf/tiago_pro.urdf` which is accessible on the host for inspection. Because the workspace is built with `--symlink-install`, the URDF is picked up immediately when created with no rebuild required.
+The full topic, controller and sensor reference is in the
+[official README](https://github.com/dfl-rlab/erc_sim_2026#ros-2-topics-and-controllers).
+Competition update of 11/09/26: book spine width is **2 cm**; the grasp
+parameters in `manipulation_node.py` are set for that width.
 
-## Reporting issues
+## Known limitations
 
-If you notice a bug, an error in the documentation, or anything in the code that needs changing, please submit an issue on the repository rather than reporting it elsewhere. This keeps all known issues visible and traceable for both participants and organisers.
-
-<img src="docs/assets/issue_submission.png" width="500"/>
-
-1. In the "Title" field, type a title for your issue.
-2. In the comment body field, type a description of your issue. To cross-reference a related discussion, paste the discussion's URL into the issue description.
-
-Before opening a new issue, search existing issues to check whether it has already been reported. When describing your issue, include:
-
-- Steps to reproduce the problem
-- Expected vs. actual behaviour
-- Relevant terminal output or logs
-- Your host environment (OS, GPU, `ROS_DOMAIN_ID` if changed from default)
+- **Real-time factor.** Without a GPU, Gazebo runs at roughly 0.1–0.4× real
+  time. Motion timeouts are generous for this reason, and a full trial takes
+  several minutes of wall time.
+- **Edge columns.** The column search is less reliable for columns 1 and 5 at
+  low real-time factor.
+- **Base alignment.** The approach drives straight at the marker, so the base
+  can stop at an angle to the shelf; grasp success depends on the book ending
+  up within the right arm's reach.
+- **Sweeping the shelf.** `navigate_to_bin` can brush books when it turns in
+  place close to the shelf.
+- **Image folder.** Annotated images are written to `src/erc_images/` (only
+  `src/` is mounted into the container), which is listed in `.gitignore`. The
+  rules ask for an `/erc_images/` folder in the team repository.
+- **Stale entries.** `erc_perception/setup.py` and `erc_solution/setup.py`
+  still list console scripts for modules that were removed (`camera_viewer`,
+  `shelf_column_detector`), and `erc_perception/package.xml` still depends on
+  `tesseract-ocr`, which the template-matching digit reader no longer uses.
 
 ## Troubleshooting
 
-**CycloneDDS serialization warnings** (`serdata.cpp` errors about null-terminated strings) — these are harmless noise from large message serialization. They don't affect functionality.
+These are from the official README.
 
-**Robot not spawning** — wait at least 5 seconds after Gazebo starts. The spawn is on a 3-second timer, books on a 5-second timer, and controllers on an 8-second timer.
+- **CycloneDDS serialization warnings** (`serdata.cpp`, null-terminated
+  strings) are harmless.
+- **Robot not spawning:** wait at least 5 s after Gazebo starts. The robot
+  spawns after 3 s, books after 5 s and controllers after 8 s.
+- **Controllers not activating:** rebuild `erc_bringup` with
+  `colcon build --symlink-install --packages-select erc_bringup` and source again.
+- **Build errors after mixing build flags:** always use `--symlink-install`;
+  recover with `rm -rf build/ install/ log/` and rebuild.
+- **After Dockerfile changes:** run `./docker/up.sh --build`.
 
-**Controllers not activating** — check that `erc_bringup` was built: `colcon build --symlink-install --packages-select erc_bringup && source install/setup.bash`
-
-**Base not strafing (lateral movement)** — ensure you're publishing to `/cmd_vel` with `linear.y` set. The mecanum drive requires the anisotropic friction parameters injected into the URDF by `generate_urdf.py`.
-
-**Build errors after mixing build flags** — always build with `--symlink-install`. Mixing symlink and non-symlink builds leaves stale artifacts; recover with `rm -rf build/ install/ log/` and rebuild.
-
-**Rebuild after Dockerfile changes** — run `./docker/up.sh --build` to rebuild the image.
+Issues with the competition environment itself should be reported on the
+[erc_sim_2026 issue tracker](https://github.com/dfl-rlab/erc_sim_2026/issues).
