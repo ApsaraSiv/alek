@@ -13,8 +13,8 @@ from ament_index_python.packages import get_package_share_directory
 
 CAMERA_TOPIC = '/head_front_camera/head_front_camera/color/image_raw'
 
-MARKER_BAND_TOP_FRACTION = 0.20
-MARKER_BAND_BOTTOM_FRACTION = 0.50
+MARKER_BAND_TOP_FRACTION = 0.05
+MARKER_BAND_BOTTOM_FRACTION = 0.60
 SAVE_INTERVAL_SEC = 2.0
 CENTER_TOLERANCE_FRACTION = 0.06  # matches state_machine_node's CENTER_LOCK_TOLERANCE.
                                    # Was 0.035 -- live testing showed the state
@@ -44,6 +44,11 @@ NORMALIZED_GLYPH_SIZE = (64, 96)
 # below the ~0.5+ scores seen for genuinely wrong/junk candidates.
 MAX_TEMPLATE_DIFFERENCE = 0.40
 MIN_TEMPLATE_MARGIN = 0.03
+# Separately, digit "5" needed an even looser margin than the (already
+# widened) global default in a teammate's own live testing -- layer that
+# on top rather than choosing between the two fixes, since they address
+# different digits' distinct matching problems.
+MIN_TEMPLATE_MARGIN_BY_DIGIT = {5: 0.015}
 
 MAX_DIGIT_WIDTH_FRACTION = 0.15
 MAX_DIGIT_HEIGHT_FRACTION = 0.25
@@ -97,9 +102,7 @@ def _box_is_on_number_plate(frame, left, top, right, bottom):
     if not dark_pixels.any():
         return False
 
-    # Real printed ink is black/grey (low saturation). Red, green and blue
-    # book spines remain highly saturated even when grayscale thresholding
-    # makes them look black to Tesseract.
+    
     low_saturation_ink = digit[:, :, 1][dark_pixels] <= MAX_BLACK_INK_SATURATION
     if low_saturation_ink.mean() < MIN_LOW_SATURATION_INK_FRACTION:
         return False
@@ -127,8 +130,6 @@ class ShelfNumberDetector(Node):
             Int32, '/erc/shelf_column_identification', 10)
         self.column_error_pub = self.create_publisher(
             Float32, '/erc/shelf_column_horizontal_error', 10)
-        # OCR is slower than the camera. A deep queue makes steering react
-        # to frames captured several seconds ago and causes repeated overshoot.
         camera_qos = QoSProfile(depth=1)
         camera_qos.reliability = ReliabilityPolicy.BEST_EFFORT
         self.create_subscription(
@@ -168,6 +169,9 @@ class ShelfNumberDetector(Node):
             top = band_top + local_top
             right = left + box_width
             bottom = top + box_height
+            
+            if left <= 0 or right >= width - 1:
+                continue
             if not _box_is_on_number_plate(frame, left, top, right, bottom):
                 continue
 
@@ -182,8 +186,10 @@ class ShelfNumberDetector(Node):
                 for digit, template in self.digit_templates.items())
             best_score, digit = scores[0]
             margin = scores[1][0] - best_score
+            required_margin = MIN_TEMPLATE_MARGIN_BY_DIGIT.get(
+                digit, MIN_TEMPLATE_MARGIN)
             if (best_score <= MAX_TEMPLATE_DIFFERENCE
-                    and margin >= MIN_TEMPLATE_MARGIN):
+                    and margin >= required_margin):
                 detections.append(
                     (digit, int(left), int(top), int(right), int(bottom),
                      best_score))
