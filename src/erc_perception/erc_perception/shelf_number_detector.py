@@ -16,13 +16,34 @@ CAMERA_TOPIC = '/head_front_camera/head_front_camera/color/image_raw'
 MARKER_BAND_TOP_FRACTION = 0.20
 MARKER_BAND_BOTTOM_FRACTION = 0.50
 SAVE_INTERVAL_SEC = 2.0
-CENTER_TOLERANCE_FRACTION = 0.035  # matches state_machine_node's CENTER_LOCK_TOLERANCE
+# 0.035 (this branch's previous value) live-tested badly: the state
+# machine's tracking correction, even sped up, rarely lands two consecutive
+# OCR frames inside that tight a band under this sim's wheel slip, so
+# column-lock kept timing out and restarting the search sweep. Keep in
+# sync with state_machine_node's CENTER_LOCK_TOLERANCE.
+CENTER_TOLERANCE_FRACTION = 0.06
 REQUIRED_CENTERED_FRAMES = 2
 GLYPH_THRESHOLD = 160
 MIN_GLYPH_AREA = 80
 NORMALIZED_GLYPH_SIZE = (64, 96)
-MAX_TEMPLATE_DIFFERENCE = 0.27
-MIN_TEMPLATE_MARGIN = 0.06
+# 0.27/0.06 (this branch's previous values) worked for digits 1/3/5 but
+# never passed for digit "2" at all -- measured directly: captured 15 live
+# frames of the real "2" marker mid-search and ran this exact scoring
+# offline. At the range SEEK_COLUMN operates from, the live glyph crop is
+# only ~20x19px (vs. the template's native ~111x133px), and "2"'s curved
+# strokes lose far more shape fidelity than "1"'s straight stroke at that
+# resolution -- its best score consistently landed at 0.35-0.44, never
+# once under 0.27, even though it was *still always the correct top-ranked
+# digit* (large margin over the 2nd-best candidate in nearly every frame).
+# Widened both thresholds to comfortably cover digit "2"'s observed range
+# while staying below the ~0.5+ scores seen for genuinely wrong candidates.
+MAX_TEMPLATE_DIFFERENCE = 0.40
+MIN_TEMPLATE_MARGIN = 0.03
+# Separately, digit "5" needed an even looser margin than the (already
+# widened) global default in live testing -- layer that on top rather than
+# choosing between the two fixes, since they address different digits'
+# distinct matching problems.
+MIN_TEMPLATE_MARGIN_BY_DIGIT = {5: 0.015}
 
 MAX_DIGIT_WIDTH_FRACTION = 0.15
 MAX_DIGIT_HEIGHT_FRACTION = 0.25
@@ -161,8 +182,10 @@ class ShelfNumberDetector(Node):
                 for digit, template in self.digit_templates.items())
             best_score, digit = scores[0]
             margin = scores[1][0] - best_score
+            required_margin = MIN_TEMPLATE_MARGIN_BY_DIGIT.get(
+                digit, MIN_TEMPLATE_MARGIN)
             if (best_score <= MAX_TEMPLATE_DIFFERENCE
-                    and margin >= MIN_TEMPLATE_MARGIN):
+                    and margin >= required_margin):
                 detections.append(
                     (digit, int(left), int(top), int(right), int(bottom),
                      best_score))
