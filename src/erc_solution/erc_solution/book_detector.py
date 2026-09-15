@@ -102,20 +102,34 @@ class BookDetector(Node):
 
     # ------------------------------------------------------------------
     def _find_target_blob(self, color_frame):
+        """Picks the target-colour blob closest to the image's horizontal
+        centre, not the largest. The shelf can have several books of the
+        same colour visible at once (one per column, colours are only
+        unique *within* a column -- see simulation.launch.py's book spawn
+        logic), and the largest-blob heuristic used to flip between two of
+        them from one frame to the next depending on which was fractionally
+        bigger. That fed manipulation_node's base-centering loop a moving
+        target it could never converge on. Whatever book the robot is
+        actually squared up to (the one nearest dead ahead) is the one we
+        actually approached/tucked the arm for, so that's the stable choice."""
         hsv = cv2.cvtColor(color_frame, cv2.COLOR_BGR2HSV)
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for lower, upper in COLOUR_RANGES[self.target_colour]:
             mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        image_center_u = color_frame.shape[1] / 2.0
         best = None
+        best_center_dist = None
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < MIN_BLOB_AREA:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
-            if best is None or w * h > best[2] * best[3]:
+            center_dist = abs((x + w / 2.0) - image_center_u)
+            if best is None or center_dist < best_center_dist:
                 best = (x, y, w, h)
+                best_center_dist = center_dist
         return best
 
     def _depth_at(self, depth_frame, u, v):
