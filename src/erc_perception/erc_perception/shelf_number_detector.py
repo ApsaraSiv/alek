@@ -13,16 +13,36 @@ from ament_index_python.packages import get_package_share_directory
 
 CAMERA_TOPIC = '/head_front_camera/head_front_camera/color/image_raw'
 
-MARKER_BAND_TOP_FRACTION = 0.05
-MARKER_BAND_BOTTOM_FRACTION = 0.60
+MARKER_BAND_TOP_FRACTION = 0.20
+MARKER_BAND_BOTTOM_FRACTION = 0.50
 SAVE_INTERVAL_SEC = 2.0
-CENTER_TOLERANCE_FRACTION = 0.035  # matches state_machine_node's CENTER_LOCK_TOLERANCE
+# 0.035 (this branch's previous value) live-tested badly: the state
+# machine's tracking correction, even sped up, rarely lands two consecutive
+# OCR frames inside that tight a band under this sim's wheel slip, so
+# column-lock kept timing out and restarting the search sweep. Keep in
+# sync with state_machine_node's CENTER_LOCK_TOLERANCE.
+CENTER_TOLERANCE_FRACTION = 0.06
 REQUIRED_CENTERED_FRAMES = 2
 GLYPH_THRESHOLD = 160
 MIN_GLYPH_AREA = 80
 NORMALIZED_GLYPH_SIZE = (64, 96)
-MAX_TEMPLATE_DIFFERENCE = 0.27
-MIN_TEMPLATE_MARGIN = 0.06
+# 0.27/0.06 (this branch's previous values) worked for digits 1/3/5 but
+# never passed for digit "2" at all -- measured directly: captured 15 live
+# frames of the real "2" marker mid-search and ran this exact scoring
+# offline. At the range SEEK_COLUMN operates from, the live glyph crop is
+# only ~20x19px (vs. the template's native ~111x133px), and "2"'s curved
+# strokes lose far more shape fidelity than "1"'s straight stroke at that
+# resolution -- its best score consistently landed at 0.35-0.44, never
+# once under 0.27, even though it was *still always the correct top-ranked
+# digit* (large margin over the 2nd-best candidate in nearly every frame).
+# Widened both thresholds to comfortably cover digit "2"'s observed range
+# while staying below the ~0.5+ scores seen for genuinely wrong candidates.
+MAX_TEMPLATE_DIFFERENCE = 0.40
+MIN_TEMPLATE_MARGIN = 0.03
+# Separately, digit "5" needed an even looser margin than the (already
+# widened) global default in live testing -- layer that on top rather than
+# choosing between the two fixes, since they address different digits'
+# distinct matching problems.
 MIN_TEMPLATE_MARGIN_BY_DIGIT = {5: 0.015}
 
 MAX_DIGIT_WIDTH_FRACTION = 0.15
@@ -77,7 +97,9 @@ def _box_is_on_number_plate(frame, left, top, right, bottom):
     if not dark_pixels.any():
         return False
 
-    
+    # Real printed ink is black/grey (low saturation). Red, green and blue
+    # book spines remain highly saturated even when grayscale thresholding
+    # makes them look black to Tesseract.
     low_saturation_ink = digit[:, :, 1][dark_pixels] <= MAX_BLACK_INK_SATURATION
     if low_saturation_ink.mean() < MIN_LOW_SATURATION_INK_FRACTION:
         return False
@@ -105,6 +127,8 @@ class ShelfNumberDetector(Node):
             Int32, '/erc/shelf_column_identification', 10)
         self.column_error_pub = self.create_publisher(
             Float32, '/erc/shelf_column_horizontal_error', 10)
+        # OCR is slower than the camera. A deep queue makes steering react
+        # to frames captured several seconds ago and causes repeated overshoot.
         camera_qos = QoSProfile(depth=1)
         camera_qos.reliability = ReliabilityPolicy.BEST_EFFORT
         self.create_subscription(
@@ -144,9 +168,6 @@ class ShelfNumberDetector(Node):
             top = band_top + local_top
             right = left + box_width
             bottom = top + box_height
-            
-            if left <= 0 or right >= width - 1:
-                continue
             if not _box_is_on_number_plate(frame, left, top, right, bottom):
                 continue
 

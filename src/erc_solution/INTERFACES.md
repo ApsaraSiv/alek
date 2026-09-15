@@ -27,17 +27,19 @@ for the +2 bonus points each. Do not pre-generate these.
 
 | Topic | Type | Published by | Consumed by | Notes |
 |---|---|---|---|---|
-| `/erc/target_shelf_point` | `geometry_msgs/PointStamped` | shelf_column_detector | navigation_node | 3D point of target column, frame_id=`base_link` (perception does the camera→base_link TF lookup before publishing) |
-| `/erc/target_book_point` | `geometry_msgs/PointStamped` | book_detector | manipulation_node | 3D point of target book, frame_id=`base_link` |
-| `/erc/collection_bin_point` | `geometry_msgs/PointStamped` | bin_detector | manipulation_node | 3D point of bin opening, frame_id=`base_link` |
-| `/erc/perception_status` | `std_msgs/String` | all perception nodes | state_machine_node | one of: `searching`, `found`, `lost` |
+| `/erc/shelf_column_horizontal_error` | `std_msgs/Float32` | shelf_number_detector | state_machine_node | **Supersedes target_shelf_point below** -- state_machine_node now spins in place and centers on this directly (odom yaw was unreliable under this sim's wheel slip), then calls `/erc/approach_shelf` (no point/waypoint math, just drives forward on LiDAR standoff) |
+| ~~`/erc/target_shelf_point`~~ | ~~`geometry_msgs/PointStamped`~~ | -- | -- | **Not implemented, superseded above** -- keeping this row so the old plan is visible, not because it's still the contract |
+| `/erc/target_book_point` | `geometry_msgs/PointStamped` | book_detector | manipulation_node | 3D point of target book, frame_id=`base_link`. Currently a **hardcoded placeholder** in book_detector.py (real image-based detection not implemented) |
+| ~~`/erc/collection_bin_point`~~ | ~~`geometry_msgs/PointStamped`~~ | -- | -- | **Not implemented.** The real bin_detector (erc_perception) only publishes `/erc/bin_identification` (`std_msgs/Bool`, visibility only, not a point). manipulation_node's place_in_bin instead uses a fixed pose, since navigate_to_bin already parks the robot at a known standoff -- see manipulation_node.py's STILL TO TUNE |
+| `/erc/perception_status` | `std_msgs/String` | all perception nodes | state_machine_node | one of: `searching`, `found`, `lost` (not currently published by any node -- also stale) |
 
 ## Navigation service/action (Person B implements, Person D calls from the state machine)
 
 | Name | Type | Notes |
 |---|---|---|
-| `/erc/navigate_to_shelf_column` | custom action or simple `std_srvs/Trigger`-style service taking column index | Blocks until robot is stopped within arm reach of the shelf, facing it |
-| `/erc/navigate_to_bin` | same pattern | Blocks until robot is back at Start/End Zone, facing the bin |
+| `/erc/approach_shelf` | `erc_interfaces/srv/ApproachShelf`, no input | **Supersedes `/erc/navigate_to_shelf_column` below.** Assumes state_machine_node has already spun in place and centered on the column via `/erc/shelf_column_horizontal_error` -- this just drives straight forward until the front LiDAR says we're within standoff distance |
+| ~~`/erc/navigate_to_shelf_column`~~ | ~~column index + wide_scan~~ | **Not implemented, superseded above** |
+| `/erc/navigate_to_bin` | `erc_interfaces/srv/NavigateToBin`, no input | Blocks until robot is back at Start/End Zone, facing the bin |
 
 While B is still building this, it's fine to stub with hardcoded waypoints —
 the state machine only cares that the call blocks and returns success/failure.
