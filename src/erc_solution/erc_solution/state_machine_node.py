@@ -8,6 +8,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.parameter import Parameter
 from std_msgs.msg import Float32, Int32
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from erc_interfaces.srv import ApproachShelf, NavigateToBin, GraspBook, PlaceInBin
@@ -18,14 +19,72 @@ ROW_WAIT_TIMEOUT = 30.0        # s
 POLL_PERIOD = 0.1               # s
 
 SPIN_ANGULAR_SPEED = -0.4      # rad/s; initial turn toward the shelf from spawn
-TRACKING_ANGULAR_SPEED = 0.12  # rad/s; correction stays below one column per OCR frame
+TRACKING_ANGULAR_SPEED = 0.25  # rad/s; was 0.12, but live testing showed the
+                                # column error decreasing only ~0.006/s at that
+                                # speed under this sim's wheel slip -- far too
+                                # slow to reach CENTER_LOCK_TOLERANCE inside
+                                # LOST_TRACK_TIMEOUT, so it kept losing lock
+                                # and restarting the search before ever
+                                # converging
 SPIN_HEAD_TILT = 0.3           # rad, tilt up so the overhead marker is in frame
 SPIN_CONTROL_PERIOD = 0.05     # s
 COLUMN_ERROR_STALE_TIME = 1.0  # s, wall time; OCR is intentionally throttled
-CENTER_LOCK_TOLERANCE = 0.035  # normalized image width, matches detector's tolerance
+LOST_TRACK_TIMEOUT = 3.0       # s, wall time -- if the marker has been out of
+                                # view this long while crawling toward its last
+                                # known side, it's genuinely lost (not just
+                                # between OCR frames): resume a full search
+                                # sweep instead of creeping blindly forever
+BRAKE_SETTLE_DURATION = 0.4    # s, wall time -- kill momentum when first
+                                # catching the marker, before switching from
+                                # SPIN_ANGULAR_SPEED to the much slower
+                                # TRACKING_ANGULAR_SPEED
+CENTER_LOCK_TOLERANCE = 0.06   # normalized image width, matches detector's
+                                # CENTER_TOLERANCE_FRACTION -- keep these two in
+                                # sync, see that file for why this was widened
 CENTER_SETTLE_DURATION = 0.5   # s, wall time - let residual rotation die down once
                                 # centred so two consecutive OCR frames can land there
-SPIN_MAX_DURATION = 180.0       # s, sim time - safety cap only, not a normal stop condition
+SPIN_MAX_DURATION = 180.0       # s, wall time - safety cap only, not a normal stop
+                                 # condition. Was sim-time, but under this sim's real-time
+                                 # factor (measured as low as ~8-38% in GUI mode) a
+                                 # sim-time deadline can take many minutes of real time to
+                                 # elapse -- switched to wall-clock so the cap actually
+                                 # behaves like the number of real seconds it says.
+
+STEP_BURST_DURATION = 0.6      # s, wall time -- ~14deg of rotation per burst at
+                                # SPIN_ANGULAR_SPEED. While still just searching
+                                # (no fresh column error), rotate in short bursts
+                                # with a full stop between them instead of one
+                                # long continuous spin. Measured via gz's own
+                                # ground-truth pose topic: a long uninterrupted
+                                # spin physically walks this skid-steer base
+                                # off its start point (>1.8m drift observed
+                                # after a search that never caught the marker
+                                # even once) -- it isn't just odom yaw error,
+                                # the robot really translates from sustained
+                                # wheel scrub while rotating. That drift can
+                                # walk the camera into a nearby wall partway
+                                # through the sweep, permanently losing line
+                                # of sight to the marker for the rest of the
+                                # search. Short bursts + full stops bound the
+                                # drift per burst and also hand OCR a
+                                # motion-blur-free stationary frame each time.
+STEP_SETTLE_DURATION = 0.5     # s, wall time -- pause after each burst, stationary,
+                                # so a clean OCR frame has time to arrive & be processed
+WALL_STANDOFF_MIN = 0.35       # m -- front LiDAR minimum range below this means the
+                                # base has drifted close enough to a wall that further
+                                # rotation risks getting physically wedged against it.
+                                # Tightened from an initial 0.55m, which over-triggered
+                                # at spawn since erc_table sits close enough to read
+                                # ~0.5-0.55m on some sweep headings without being an
+                                # actual collision risk while just rotating in place.
+BACKUP_LINEAR_SPEED = -0.15    # m/s -- reverse speed for the wall recovery backup
+BACKUP_DURATION = 1.0          # s, wall time -- enough to clear WALL_STANDOFF_MIN
+                                # from a corner at BACKUP_LINEAR_SPEED with margin
+MAX_CONSECUTIVE_BACKUPS = 3    # safety cap -- if backing up repeatedly doesn't
+                                # clear WALL_STANDOFF_MIN (e.g. a fixture that's
+                                # just always nearby, not actually blocking), give
+                                # up backing away and resume the sweep anyway
+                                # rather than looping forever
 
 
 class StateMachineNode(Node):
@@ -67,6 +126,11 @@ class StateMachineNode(Node):
             Int32, '/erc/shelf_row_identification',
             self._on_row_identified, 10, callback_group=cb_group)
 
+        self.front_scan_min_range = None
+        self.create_subscription(
+            LaserScan, '/scan_front_raw',
+            self._on_front_scan, 10, callback_group=cb_group)
+
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.head_pub = self.create_publisher(
             JointTrajectory, '/head_controller/joint_trajectory', 10)
@@ -105,6 +169,10 @@ class StateMachineNode(Node):
     def _on_column_error(self, msg: Float32):
         self.column_error = msg.data
         self.column_error_at = time.time()
+
+    def _on_front_scan(self, msg: LaserScan):
+        finite = [r for r in msg.ranges if r == r and r > 0.0]
+        self.front_scan_min_range = min(finite) if finite else None
 
     def _run_once(self):
         if self._started:
@@ -201,35 +269,96 @@ class StateMachineNode(Node):
         corrupts odom's own yaw estimate badly enough that a convergence
         check against it can self-report "aligned" long before the robot
         has actually turned that far (established separately). Command a
-        continuous spin directly and stop the INSTANT perception confirms
-        the marker - never based on any position/yaw estimate."""
+        spin directly and stop the INSTANT perception confirms the marker
+        - never based on any position/yaw estimate.
+
+        Search sweeping is step-and-stop, not one continuous spin: checked
+        against gz sim's own ground-truth pose topic, a long uninterrupted
+        spin genuinely translates this skid-steer base (>1.8m measured
+        after a search that never caught the marker), not just odom's yaw
+        -- confirmed by comparing that same drift against odom's own
+        position estimate, which matched ground truth closely (it's
+        specifically yaw that odom gets wrong here, not position). That
+        drift can walk the camera into a nearby wall mid-sweep and
+        permanently lose the marker for the remainder of the search. See
+        STEP_BURST_DURATION above."""
         self._publish_head_tilt(SPIN_HEAD_TILT)
         time.sleep(1.0)  # give the head a moment to actually get there
 
         spin_start = time.time()
-        deadline = self.get_clock().now().nanoseconds / 1e9 + SPIN_MAX_DURATION
+        deadline = spin_start + SPIN_MAX_DURATION
         twist = Twist()
         twist.angular.z = SPIN_ANGULAR_SPEED
         last_correction_sign = None
+        consecutive_backups = 0
 
         self.get_logger().info('SEEK_COLUMN: spinning until shelf_column_number is seen')
 
-        while self.get_clock().now().nanoseconds / 1e9 < deadline:
+        while time.time() < deadline:
             if (self.column_error_at is not None
                     and time.time() - self.column_error_at <= COLUMN_ERROR_STALE_TIME):
                 if abs(self.column_error) <= CENTER_LOCK_TOLERANCE:
-                    
                     self.cmd_vel_pub.publish(Twist())
                     time.sleep(CENTER_SETTLE_DURATION)
                     if self.column_confirmed_at is not None and self.column_confirmed_at >= spin_start:
                         break
                     continue
+                if last_correction_sign is None:
+                    # Just caught the marker while still sweeping at full
+                    # SPIN_ANGULAR_SPEED -- brake first. Without this, the
+                    # robot's momentum (this sim has severe wheel slip, see
+                    # docstring above) carries it straight past the marker
+                    # before the much slower TRACKING_ANGULAR_SPEED command
+                    # actually takes effect, so it loses lock almost
+                    # immediately -- observed as a catch-lose cycle
+                    # repeating every ~14s without ever converging.
+                    self.cmd_vel_pub.publish(Twist())
+                    time.sleep(BRAKE_SETTLE_DURATION)
                 last_correction_sign = math.copysign(1.0, self.column_error)
                 twist.angular.z = -math.copysign(TRACKING_ANGULAR_SPEED, self.column_error)
-            elif last_correction_sign is not None:
+            elif (last_correction_sign is not None
+                    and time.time() - self.column_error_at <= LOST_TRACK_TIMEOUT):
                 twist.angular.z = -math.copysign(TRACKING_ANGULAR_SPEED, last_correction_sign)
             else:
+                if last_correction_sign is not None:
+                    self.get_logger().info(
+                        'SEEK_COLUMN: lost the marker while tracking -- '
+                        'resuming step-scan sweep')
+                    last_correction_sign = None
+                # Wall recovery: if drift (bounded per-burst, but still
+                # cumulative over a long search) has carried the base close
+                # to an obstacle, back away before rotating further instead
+                # of risking getting physically wedged against it -- see
+                # WALL_STANDOFF_MIN docstring above. Capped at
+                # MAX_CONSECUTIVE_BACKUPS: a fixture that's just always
+                # somewhat nearby (not actually blocking) would otherwise
+                # keep re-triggering this forever without ever clearing it.
+                if (self.front_scan_min_range is not None
+                        and self.front_scan_min_range < WALL_STANDOFF_MIN
+                        and consecutive_backups < MAX_CONSECUTIVE_BACKUPS):
+                    consecutive_backups += 1
+                    self.get_logger().info(
+                        f'SEEK_COLUMN: front range {self.front_scan_min_range:.2f}m < '
+                        f'{WALL_STANDOFF_MIN}m -- backing away before continuing sweep '
+                        f'(attempt {consecutive_backups}/{MAX_CONSECUTIVE_BACKUPS})')
+                    backup = Twist()
+                    backup.linear.x = BACKUP_LINEAR_SPEED
+                    self.cmd_vel_pub.publish(backup)
+                    time.sleep(BACKUP_DURATION)
+                    self.cmd_vel_pub.publish(Twist())
+                    time.sleep(STEP_SETTLE_DURATION)
+                    continue
+                consecutive_backups = 0
+                # Step-and-stop instead of continuous spin -- see
+                # STEP_BURST_DURATION docstring above for why.
                 twist.angular.z = SPIN_ANGULAR_SPEED
+                self.cmd_vel_pub.publish(twist)
+                time.sleep(STEP_BURST_DURATION)
+                self.cmd_vel_pub.publish(Twist())
+                if self.column_confirmed_at is not None and self.column_confirmed_at >= spin_start:
+                    break
+                time.sleep(STEP_SETTLE_DURATION)
+                continue
             self.cmd_vel_pub.publish(twist)
             if self.column_confirmed_at is not None and self.column_confirmed_at >= spin_start:
                 break
@@ -264,8 +393,11 @@ class StateMachineNode(Node):
         return future.result()
 
     def _wait_for_row(self, timeout_sec):
-        deadline = self.get_clock().now().nanoseconds / 1e9 + timeout_sec
-        while self.target_row is None and self.get_clock().now().nanoseconds / 1e9 < deadline:
+        # Wall-clock, not sim-time -- see SPIN_MAX_DURATION's docstring for
+        # why a sim-time deadline can take many minutes of real time to
+        # elapse under this sim's slow real-time factor.
+        deadline = time.time() + timeout_sec
+        while self.target_row is None and time.time() < deadline:
             time.sleep(POLL_PERIOD)
         return self.target_row is not None
 
