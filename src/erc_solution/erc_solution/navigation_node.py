@@ -18,7 +18,11 @@ BIN_Y = 0.0
 
 # stand off far enough that the base stops within arm/camera reach instead
 # of driving into the shelf or bin
-SHELF_STANDOFF = 1.0
+# 1.0 parked the base ~0.98m from the shelf front, putting the book face
+# ~1.04m ahead: the grasp pose then needs the tool ~0.92m out, just past
+# arm_right's ~0.9m forward reach, and the final straight-line move in was
+# only 67% feasible (seed 11, yellow row 4). 0.85 closes that gap.
+SHELF_STANDOFF = 0.85
 # Park well back from the bin: the book is carried below table height, and
 # place_in_bin lifts it above the rim before driving the last stretch in.
 BIN_STANDOFF = 1.1
