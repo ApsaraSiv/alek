@@ -1,65 +1,43 @@
+#!/usr/bin/env python3
 """
-manipulation_node.py
+arm_manipulation_node.py
 
-Right-arm pick-and-place for the ERC 2026 Phase 1 solution. Implements the
-Manipulation side of the erc_solution service contract (see INTERFACES.md):
-exposes /erc/grasp_book and /erc/place_in_bin, called by state_machine_node.
+Right-arm pick-and-place node for the ERC 2026 Simulation Phase.
 
-Talks directly to move_group via the low-level moveit_msgs/action/MoveGroup
-action interface (moveit_py is not installed in this image). MoveIt config
-lives in src/tiago_pro_right_arm_moveit_config (Setup Assistant-generated,
-since the base repo ships no SRDF/MoveIt config despite claiming one).
-Confirmed working values:
+Talks directly to the running `move_group` node via the low-level
+moveit_msgs/action/MoveGroup action interface (NOT moveit_py, which
+is not installed in this image -- confirmed via
+`python3 -c "from moveit.planning import MoveItPy"` failing with
+ModuleNotFoundError).
+
+Confirmed working values from this team's own MoveIt Setup Assistant
+run (see chat history):
   - planning group: arm_right
   - end-effector link: arm_right_tool_link
-  - planning frame: base_footprint
-  - gripper: /gripper_right_controller_raw/joint_trajectory,
-    joint gripper_right_finger_joint
+  - base frame / virtual joint child link: base_footprint
+  - gripper controller joint (from repo README): gripper_right_finger_joint
 
-Ported from this team's aleksandria/arm_manipulation_node.py standalone
-prototype (verified end-to-end against move_group in Gazebo -- see that
-package for the original dev/test harness). The prototype ran its sequence
-autonomously off a single pose topic; this version is restructured as
-service handlers callable from state_machine_node, consuming the contract's
-/erc/target_book_point for grasp_book.
+Assumes a separate perception node publishes the target book's pose
+(geometry_msgs/PoseStamped) on /erc/target_book_pose. This node then:
+  1. Moves the right arm to a pre-grasp "hover" pose in front of the book
+  2. Opens the gripper
+  3. Moves in to the grasp pose
+  4. Closes the gripper on the book
+  5. Retreats to the hover pose (lifting the book clear of the shelf)
+  6. Moves to the collection bin drop pose
+  7. Opens the gripper to release the book
 
-place_in_bin does NOT use a live point: INTERFACES.md still describes
-/erc/collection_bin_point (geometry_msgs/PointStamped) from bin_detector,
-but the real bin_detector (erc_perception, merged after that doc was
-written) only publishes /erc/bin_identification -- a visibility Bool, not
-a point. Nothing publishes a bin point. Instead this uses a fixed pose in
-the planning frame, since navigate_to_bin (navigation_node) already parks
-the robot at a known standoff facing the bin -- see STILL TO TUNE below.
+STILL TO TUNE (same as before -- unrelated to the MoveIt backend swap):
+  - approach_offset (dx, dy, dz): the vector (in base_frame) from the
+    book's pose to a safe hover point before/after grasping. Books sit
+    on a shelf, so this is likely a horizontal standoff, not vertical.
+  - bin_pose: fixed pose in base_frame for the collection bin. Measure
+    this once and hard-code it.
 
-Runs under a MultiThreadedExecutor with a ReentrantCallbackGroup so a
-blocking service call (grasp_book/place_in_bin) doesn't starve the
-move_group action client's own callbacks or the point subscriptions --
-same pattern state_machine_node and navigation_node use. Blocking on a
-future is done with a plain poll loop (not spin_until_future_complete,
-which tries to attach this node to a second executor and fails since the
-node is already spinning under executor.spin()).
-
-STILL TO TUNE:
-  - approach_offset (dx, dy, dz): vector from the grasp point to a safe
-    hover point before/after grasping. Books sit on a shelf, so this is
-    likely a horizontal standoff -- revisit once book_detector is real and
-    we can see actual geometry.
-  - place_x/y/z: hardcoded pose (planning frame) for place_in_bin, guessed
-    from navigation_node's BIN_STANDOFF (0.7m) and BOOK_APPROACH_HEAD_TILT.
-    Not measured against the actual bin model. Revisit if bin_detector ever
-    grows a point output, or once someone measures the real bin opening
-    position relative to where navigate_to_bin parks the robot.
-  - request.row (GraspBook) is accepted (contract requires it) but not
-    used yet -- book height comes entirely from /erc/target_book_point's
-    z-coordinate. If arm_right can't reach all shelf rows once perception
-    is real and this gets tested end to end, add a torso-lift step keyed
-    on row here.
-
-TEST TIP: with move_group running, publish a fake point and call the
-service directly (no perception, no state machine, needed):
-  ros2 topic pub /erc/target_book_point geometry_msgs/msg/PointStamped \
-    "{header: {frame_id: 'base_footprint'}, point: {x: 0.6, y: 0.0, z: 0.9}}"
-  ros2 service call /erc/grasp_book erc_interfaces/srv/GraspBook "{row: 1}"
+TEST TIP: before wiring this to real perception, publish a fake pose
+by hand and watch it work in isolation:
+  ros2 topic pub /erc/target_book_pose geometry_msgs/msg/PoseStamped \
+    "{header: {frame_id: 'base_footprint'}, pose: {position: {x: 0.6, y: 0.0, z: 0.9}, orientation: {w: 1.0}}}"
 """
 
 import time
@@ -67,11 +45,8 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.parameter import Parameter
 
-from geometry_msgs.msg import PointStamped, PoseStamped, Vector3, Twist
+from geometry_msgs.msg import PoseStamped, Vector3
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from shape_msgs.msg import SolidPrimitive
 
@@ -84,135 +59,75 @@ from moveit_msgs.msg import (
     OrientationConstraint,
 )
 
-from erc_interfaces.srv import GraspBook, PlaceInBin
-
-import math
 import tf2_ros
-from tf2_geometry_msgs import do_transform_point
+from tf2_geometry_msgs import do_transform_pose_stamped
 
-MOVEIT_SUCCESS = 1  # moveit_msgs/msg/MoveItErrorCodes.SUCCESS
-
-# arm_right is mounted on the right side of the torso -- /compute_ik testing
-# in Gazebo shows it can only reach roughly up to y=0.15m to the *left* of
-# base_footprint (past that IK returns NO_IK_SOLUTION even with a wide-open
-# orientation tolerance). book_detector's point is wherever the book actually
-# sits in its shelf slot, which is often well past that, so grasp planning
-# would just fail outright with "unable to sample any valid states for goal
-# tree." Rotate the base to bring the book onto the arm's forward axis first.
-MAX_REACHABLE_ABS_Y = 0.15      # m, planning-frame y, see above
-CENTERING_ANGULAR_SPEED = 0.3   # rad/s
-CENTERING_SETTLE_SEC = 1.0      # s, let the wheels stop and a fresh point arrive
+# MoveItErrorCodes.SUCCESS
+MOVEIT_SUCCESS = 1
 
 
-def clamp_angle(angle, limit):
-    return math.copysign(min(abs(angle), limit), angle) if angle else 0.0
-
-
-class ManipulationNode(Node):
+class ArmManipulationNode(Node):
     def __init__(self):
-        super().__init__('manipulation_node', parameter_overrides=[
-            Parameter('use_sim_time', Parameter.Type.BOOL, True),
-        ])
+        super().__init__('arm_manipulation_node')
 
-        # --- Tunable parameters (confirmed names from the team's MoveIt setup) ---
+        # --- Tunable parameters (confirmed names from your own setup) ---
         self.declare_parameter('planning_group', 'arm_right')
         self.declare_parameter('eef_link', 'arm_right_tool_link')
-        self.declare_parameter('planning_frame', 'base_footprint')
+        self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('approach_dx', -0.15)
         self.declare_parameter('approach_dy', 0.0)
         self.declare_parameter('approach_dz', 0.0)
-        # Fixed place pose (planning frame) -- see STILL TO TUNE above.
-        self.declare_parameter('place_x', 0.6)
-        self.declare_parameter('place_y', 0.0)
-        self.declare_parameter('place_z', 0.9)
         self.declare_parameter('gripper_open', 0.04)
         self.declare_parameter('gripper_closed', 0.0)
         self.declare_parameter('position_tolerance', 0.01)
         self.declare_parameter('orientation_tolerance', 0.05)
         self.declare_parameter('planning_time', 5.0)
-        self.declare_parameter('point_wait_timeout', 5.0)
+        # Placeholder -- measure the real bin pose in base_frame and set these.
+        self.declare_parameter('bin_x', 0.5)
+        self.declare_parameter('bin_y', -0.4)
+        self.declare_parameter('bin_z', 0.9)
 
         self.planning_group = self.get_parameter('planning_group').value
         self.eef_link = self.get_parameter('eef_link').value
-        self.planning_frame = self.get_parameter('planning_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
         self.approach_offset = (
             self.get_parameter('approach_dx').value,
             self.get_parameter('approach_dy').value,
             self.get_parameter('approach_dz').value,
-        )
-        self.place_xyz = (
-            self.get_parameter('place_x').value,
-            self.get_parameter('place_y').value,
-            self.get_parameter('place_z').value,
         )
         self.gripper_open = self.get_parameter('gripper_open').value
         self.gripper_closed = self.get_parameter('gripper_closed').value
         self.pos_tol = self.get_parameter('position_tolerance').value
         self.orient_tol = self.get_parameter('orientation_tolerance').value
         self.planning_time = self.get_parameter('planning_time').value
-        self.point_wait_timeout = self.get_parameter('point_wait_timeout').value
-
-        cb_group = ReentrantCallbackGroup()
+        self.bin_pose = self.make_pose(
+            self.get_parameter('bin_x').value,
+            self.get_parameter('bin_y').value,
+            self.get_parameter('bin_z').value,
+            self.base_frame,
+        )
 
         # --- MoveGroup action client (talks to the already-running move_group) ---
-        self.move_group_client = ActionClient(
-            self, MoveGroup, '/move_action', callback_group=cb_group)
+        self.move_group_client = ActionClient(self, MoveGroup, '/move_action')
 
         # --- Gripper: direct topic publish, matching the controller interface ---
-        # NOTE: the spawned controller is gripper_right_controller_raw (see
-        # erc_bringup/config/controller_params.yaml) -- the non-_raw topic
-        # has no subscriber, so publishing there silently does nothing.
         self.gripper_pub = self.create_publisher(
-            JointTrajectory, '/gripper_right_controller_raw/joint_trajectory', 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+            JointTrajectory, '/gripper_right_controller/joint_trajectory', 10)
 
-        # --- TF for transforming perception output into the planning frame ---
+        # --- TF for transforming perception output into base_frame ---
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # --- Perception input (contract: geometry_msgs/PointStamped, frame base_link) ---
-        # No equivalent subscription for the bin -- see module docstring,
-        # place_in_bin uses a fixed pose instead.
-        self.latest_book_point = None
+        # --- Perception input ---
+        self.task_started = False
+        self.pending_pose = None
         self.create_subscription(
-            PointStamped, '/erc/target_book_point', self._on_book_point, 10,
-            callback_group=cb_group)
+            PoseStamped, '/erc/target_book_pose', self.book_pose_callback, 10)
 
-        # --- Manipulation service contract (state_machine_node calls these) ---
-        self.create_service(
-            GraspBook, '/erc/grasp_book', self._on_grasp_book, callback_group=cb_group)
-        self.create_service(
-            PlaceInBin, '/erc/place_in_bin', self._on_place_in_bin, callback_group=cb_group)
-
-        self.get_logger().info(
-            'Manipulation node ready (right arm) -- waiting for grasp_book/place_in_bin calls')
+        self.get_logger().info('Arm manipulation node ready — waiting for target book pose...')
 
     # ------------------------------------------------------------------
-    def _on_book_point(self, msg: PointStamped):
-        self.latest_book_point = msg
-
-    def _wait_for_point(self, attr_name):
-        deadline = time.monotonic() + self.point_wait_timeout
-        while time.monotonic() < deadline:
-            point = getattr(self, attr_name)
-            if point is not None:
-                return point
-            time.sleep(0.05)
-        return None
-
-    # ------------------------------------------------------------------
-    def transform_to_planning_frame(self, point_stamped: PointStamped):
-        if point_stamped.header.frame_id == self.planning_frame:
-            return point_stamped
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.planning_frame, point_stamped.header.frame_id, rclpy.time.Time())
-            return do_transform_point(point_stamped, transform)
-        except Exception as e:
-            self.get_logger().warn(f'TF transform to {self.planning_frame} failed: {e}')
-            return None
-
-    def make_pose(self, x, y, z, frame_id, qx=0.0, qy=0.0, qz=0.0, qw=1.0) -> PoseStamped:
+    def make_pose(self, x, y, z, frame_id, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
         p = PoseStamped()
         p.header.frame_id = frame_id
         p.pose.position.x = x
@@ -223,11 +138,6 @@ class ManipulationNode(Node):
         p.pose.orientation.z = qz
         p.pose.orientation.w = qw
         return p
-
-    def point_to_pose(self, point_stamped: PointStamped) -> PoseStamped:
-        return self.make_pose(
-            point_stamped.point.x, point_stamped.point.y, point_stamped.point.z,
-            point_stamped.header.frame_id)
 
     def offset_pose(self, pose_stamped: PoseStamped, dx, dy, dz) -> PoseStamped:
         return self.make_pose(
@@ -241,52 +151,16 @@ class ManipulationNode(Node):
             pose_stamped.pose.orientation.w,
         )
 
-    def _rotate_base(self, angle_rad):
-        cmd = Twist()
-        cmd.angular.z = math.copysign(CENTERING_ANGULAR_SPEED, angle_rad)
-        duration = abs(angle_rad) / CENTERING_ANGULAR_SPEED
-        end_time = time.monotonic() + duration
-        while time.monotonic() < end_time:
-            self.cmd_vel_pub.publish(cmd)
-            time.sleep(0.05)
-        self.cmd_vel_pub.publish(Twist())
-
-    def _center_on_book(self, book_pose: PoseStamped, max_attempts=5):
-        """Rotate the base so the book point lands on arm_right's forward
-        reach axis (small |y| in the planning frame) instead of off to the
-        side where no IK solution exists. Open-loop (no odom feedback,
-        just the known bearing angle in the base-fixed planning frame),
-        re-checked against a fresh book point after each turn since the
-        blob's apparent position shifts as the base rotates."""
-        for attempt in range(max_attempts):
-            x = book_pose.pose.position.x
-            y = book_pose.pose.position.y
-            bearing = math.atan2(y, x)
-            # Clamp the turn: a full-bearing rotation in one shot can swing
-            # the camera past this book's column onto a neighbouring one
-            # (each column can have its own book of the same target colour),
-            # which showed up as the tracked point suddenly jumping to a
-            # wildly different offset instead of converging. Small steps
-            # keep the same book in frame across attempts.
-            bearing = clamp_angle(bearing, math.radians(15.0))
-            self.get_logger().info(
-                f'book at y={y:.2f}m (> {MAX_REACHABLE_ABS_Y}m reach limit) -- '
-                f'rotating base {math.degrees(bearing):.1f} deg to center it (attempt {attempt + 1})')
-            self._rotate_base(bearing)
-            time.sleep(CENTERING_SETTLE_SEC)
-
-            self.latest_book_point = None
-            fresh_point = self._wait_for_point('latest_book_point')
-            if fresh_point is None:
-                self.get_logger().warn('no fresh target_book_point after centering turn')
-                return None
-            fresh_point = self.transform_to_planning_frame(fresh_point)
-            if fresh_point is None:
-                return None
-            book_pose = self.point_to_pose(fresh_point)
-            if abs(book_pose.pose.position.y) <= MAX_REACHABLE_ABS_Y:
-                return book_pose
-        return None
+    def transform_to_base(self, pose_stamped: PoseStamped):
+        if pose_stamped.header.frame_id == self.base_frame:
+            return pose_stamped
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame, pose_stamped.header.frame_id, rclpy.time.Time())
+            return do_transform_pose_stamped(pose_stamped, transform)
+        except Exception as e:
+            self.get_logger().warn(f'TF transform to {self.base_frame} failed: {e}')
+            return None
 
     # ------------------------------------------------------------------
     def pose_to_constraints(self, pose_stamped: PoseStamped, link_name: str) -> Constraints:
@@ -316,20 +190,10 @@ class ManipulationNode(Node):
 
         return constraints
 
-    @staticmethod
-    def _block_on_future(future, timeout_sec=30.0, poll=0.02):
-        deadline = time.monotonic() + timeout_sec
-        while not future.done():
-            if time.monotonic() > deadline:
-                return None
-            time.sleep(poll)
-        return future.result()
-
     def move_to_pose(self, pose_stamped: PoseStamped) -> bool:
-        """Blocking helper: plan AND execute a move to the given pose. Safe to
-        call from a service callback under MultiThreadedExecutor -- polls the
-        futures instead of calling spin_until_future_complete (see module
-        docstring for why)."""
+        """Blocking helper: plan AND execute a move to the given pose.
+        Must be called from the main thread (not from inside a
+        subscription callback) -- see note in main() below."""
         goal_msg = MoveGroup.Goal()
         goal_msg.request = MotionPlanRequest()
         goal_msg.request.group_name = self.planning_group
@@ -344,23 +208,18 @@ class ManipulationNode(Node):
         goal_msg.planning_options = PlanningOptions()
         goal_msg.planning_options.plan_only = False  # plan AND execute
 
-        if not self.move_group_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error('/move_action server not available')
-            return False
-
+        self.move_group_client.wait_for_server()
         send_goal_future = self.move_group_client.send_goal_async(goal_msg)
-        goal_handle = self._block_on_future(send_goal_future)
+        rclpy.spin_until_future_complete(self, send_goal_future)
+        goal_handle = send_goal_future.result()
 
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().warn('MoveGroup goal was rejected')
             return False
 
         result_future = goal_handle.get_result_async()
-        result_wrapper = self._block_on_future(result_future)
-        if result_wrapper is None:
-            self.get_logger().warn('MoveGroup result timed out')
-            return False
-        result = result_wrapper.result
+        rclpy.spin_until_future_complete(self, result_future)
+        result = result_future.result().result
 
         if result.error_code.val == MOVEIT_SUCCESS:
             return True
@@ -380,83 +239,69 @@ class ManipulationNode(Node):
         time.sleep(duration_sec + 0.5)  # crude wait for the motion to finish
 
     # ------------------------------------------------------------------
-    def _on_grasp_book(self, request, response):
-        book_point = self._wait_for_point('latest_book_point')
-        if book_point is None:
-            response.success = False
-            response.message = 'timed out waiting for /erc/target_book_point'
-            return response
+    def book_pose_callback(self, msg: PoseStamped):
+        """Only stores the pose -- does NOT run planning here. Planning
+        involves blocking spin_until_future_complete() calls, which must
+        not be nested inside a callback that's already running under an
+        outer spin(). See main()."""
+        if self.task_started:
+            return
+        book_pose = self.transform_to_base(msg)
+        if book_pose is None:
+            return
+        self.task_started = True
+        self.pending_pose = book_pose
+        self.get_logger().info('Target book pose received and transformed — ready to run')
 
-        book_point = self.transform_to_planning_frame(book_point)
-        if book_point is None:
-            response.success = False
-            response.message = f'TF transform of target_book_point to {self.planning_frame} failed'
-            return response
-
-        book_pose = self.point_to_pose(book_point)
-
-        if abs(book_pose.pose.position.y) > MAX_REACHABLE_ABS_Y:
-            book_pose = self._center_on_book(book_pose)
-            if book_pose is None:
-                response.success = False
-                response.message = (
-                    'book stayed out of arm_right reach after centering the base on it')
-                return response
-
+    def run_pick_and_place(self, book_pose: PoseStamped):
         dx, dy, dz = self.approach_offset
         pregrasp = self.offset_pose(book_pose, dx, dy, dz)
 
+        # 1. Hover in front of the book
         if not self.move_to_pose(pregrasp):
-            response.success = False
-            response.message = 'failed to plan/move to pre-grasp hover pose'
-            return response
+            return
 
+        # 2. Open gripper before moving in
         self.set_gripper(self.gripper_open)
 
+        # 3. Move in to the book
         if not self.move_to_pose(book_pose):
-            response.success = False
-            response.message = 'failed to plan/move to grasp pose'
-            return response
+            return
 
+        # 4. Close gripper on the book
         self.set_gripper(self.gripper_closed)
-        self.move_to_pose(pregrasp)  # retreat clear of the shelf; best-effort
 
-        response.success = True
-        response.message = 'book grasped'
-        return response
+        # 5. Retreat with the book
+        self.move_to_pose(pregrasp)
 
-    def _on_place_in_bin(self, request, response):
-        # Fixed pose, not a live point -- see module docstring.
-        px, py, pz = self.place_xyz
-        bin_pose = self.make_pose(px, py, pz, self.planning_frame)
-        dx, dy, dz = self.approach_offset
-        hover = self.offset_pose(bin_pose, dx, dy, dz)
+        # 6. Move to the bin
+        if not self.move_to_pose(self.bin_pose):
+            return
 
-        if not self.move_to_pose(hover):
-            response.success = False
-            response.message = 'failed to plan/move above the bin'
-            return response
-
-        if not self.move_to_pose(bin_pose):
-            response.success = False
-            response.message = 'failed to plan/move down into the bin'
-            return response
-
+        # 7. Release the book
         self.set_gripper(self.gripper_open)
-        self.move_to_pose(hover)  # retreat; best-effort
 
-        response.success = True
-        response.message = 'book placed in bin'
-        return response
+        self.get_logger().info('Pick-and-place sequence complete')
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ManipulationNode()
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(node)
+    node = ArmManipulationNode()
+
+    # Wait for the perception pose here in the main thread rather than
+    # triggering the pick-and-place sequence from inside the subscription
+    # callback -- move_to_pose() blocks on spin_until_future_complete(),
+    # and nesting that inside an already-running spin() is unsafe in rclpy.
     try:
-        executor.spin()
+        while rclpy.ok() and not node.task_started:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+        if rclpy.ok() and node.pending_pose is not None:
+            node.run_pick_and_place(node.pending_pose)
+
+        # Keep the node alive afterward (e.g. for TF, or in case you add
+        # a reset trigger later) instead of exiting immediately.
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
