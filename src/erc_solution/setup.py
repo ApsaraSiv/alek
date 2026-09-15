@@ -23,9 +23,9 @@ setup(
         'console_scripts': [
             'state_machine_node = erc_solution.state_machine_node:main',
             'shelf_column_detector = erc_solution.shelf_column_detector:main',
-            'book_detector = erc_solution.book_detector:main',
             'navigation_node = erc_solution.navigation_node:main',
             'manipulation_node = erc_solution.manipulation_node:main',
+            'book_point_detector = erc_solution.book_point_detector:main',
         ],
     },
 )
