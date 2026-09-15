@@ -29,6 +29,8 @@ BOX_COLOUR_BGR = {
 
 MIN_BLOB_AREA = 200
 SAVE_INTERVAL_SEC = 2.0
+CENTER_BAND_FRACTION = 0.5  # fraction of frame width, centered -- see the
+                            # target-selection comment in image_callback
 
 
 CAMERA_TIMEOUT_SEC = 5.0
@@ -93,7 +95,9 @@ class BookColorDetector(Node):
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         annotated = frame.copy()
-        image_height = frame.shape[0]
+        image_height, image_width = frame.shape[:2]
+        band_left = image_width * (0.5 - CENTER_BAND_FRACTION / 2)
+        band_right = image_width * (0.5 + CENTER_BAND_FRACTION / 2)
 
         target_box = None  # (x, y, w, h) of the largest target-coloured blob
 
@@ -112,7 +116,20 @@ class BookColorDetector(Node):
                 cv2.putText(annotated, colour_name, (x, y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
 
-                if colour_name == self.target_colour:
+                # Restrict which blob can become the TARGET (not what gets
+                # drawn/saved -- the annotated image still shows every
+                # detection) to a centered horizontal band. Every column has
+                # exactly one book of each colour, and the camera's FOV at
+                # shelf standoff is wide enough to catch part of the
+                # neighbouring columns too -- without this, "largest blob of
+                # the target colour anywhere in frame" can lock onto a
+                # neighbour column's same-coloured book instead of the
+                # actually-centered target column's. See
+                # book_point_detector.py's CENTER_BAND_FRACTION for the
+                # live-run evidence (a grasp closed ~0.8m off from the real
+                # target book, consistent with a neighbour column).
+                centre_x = x + w / 2
+                if colour_name == self.target_colour and band_left <= centre_x <= band_right:
                     if target_box is None or w * h > target_box[2] * target_box[3]:
                         target_box = (x, y, w, h)
 
