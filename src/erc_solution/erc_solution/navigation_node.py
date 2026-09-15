@@ -19,7 +19,9 @@ BIN_Y = 0.0
 # stand off far enough that the base stops within arm/camera reach instead
 # of driving into the shelf or bin
 SHELF_STANDOFF = 1.0
-BIN_STANDOFF = 0.7
+# Park well back from the bin: the book is carried below table height, and
+# place_in_bin lifts it above the rim before driving the last stretch in.
+BIN_STANDOFF = 1.1
 
 BOOK_APPROACH_HEAD_TILT = -0.15  # rad, tilt down a bit for the books
 
@@ -57,18 +59,18 @@ ARM_RIGHT_TUCK_WAYPOINTS = (
     ((-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0), 9),
 )
 
-# In Gazebo the arms settle ~0.1-0.15 rad short of PAL's home on joints 2/4
-# (pressed against the torso), which still leaves both hands within ~0.4m
-# of base_footprint -- close enough. The 9s trajectory is in sim time, and
-# the sim runs well under real time here, so the wall-clock wait is generous.
 # PAL's home torso height -- at 0.0 the tucked arms press into base_link
 # (MoveIt's /check_state_validity agrees), so raise to this before tucking.
 TORSO_HOME = 0.10          # m
 TORSO_TOLERANCE = 0.01     # m
-TORSO_TIMEOUT = 60.0       # s, wall time; the sim torso tracks slowly
+TORSO_TIMEOUT = 300.0      # s, wall time; the sim torso tracks slowly (~0.13x real time)
 
+# In Gazebo the arms settle ~0.1-0.15 rad short of PAL's home on joints 2/4
+# (pressed against the torso), which still leaves both hands within ~0.4m
+# of base_footprint -- close enough. The 9s trajectory is in sim time, and
+# the sim runs well under real time here, so the wall-clock wait is generous.
 ARM_TUCK_TOLERANCE = 0.2   # rad, per joint
-ARM_TUCK_TIMEOUT = 60.0    # s, wall time
+ARM_TUCK_TIMEOUT = 300.0   # s, wall time
 
 TRUE_YAW_MINUS_ODOM_YAW = math.pi / 2
 

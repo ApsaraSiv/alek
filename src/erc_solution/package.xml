@@ -16,6 +16,8 @@
   <depend>trajectory_msgs</depend>
   <depend>shape_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>python3-opencv</depend>
+  <depend>python3-numpy</depend>
   <depend>image_transport</depend>
   <depend>erc_interfaces</depend>
   <depend>moveit_msgs</depend>

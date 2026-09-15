@@ -47,9 +47,9 @@ node:
 STILL TO TUNE:
   - approach_offset (dx, dy, dz): vector from the grasp point to a safe
     hover point before/after grasping.
-  - place_x/y/z: hardcoded pose (planning frame) for place_in_bin, guessed
-    from navigation_node's BIN_STANDOFF (0.7m). Not measured against the
-    actual bin model.
+  - place_in_bin measures the bin rim, bin centre and table top from the
+    head camera (see _perceive_bin); it assumes the robot is already parked
+    facing the bin within arm reach (navigate_to_bin's job).
   - request.row (GraspBook) is accepted (contract requires it) but not
     used yet -- book height comes entirely from /erc/target_book_pose's
     z-coordinate.
@@ -64,6 +64,8 @@ service directly (no perception, no state machine, needed):
 import math
 import time
 
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -73,11 +75,13 @@ from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3, Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import CameraInfo, Image, JointState, LaserScan
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from shape_msgs.msg import SolidPrimitive
 
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.srv import GetCartesianPath
+from rclpy.duration import Duration
 from moveit_msgs.msg import (
     MotionPlanRequest,
     PlanningOptions,
@@ -89,9 +93,22 @@ from moveit_msgs.msg import (
 from erc_interfaces.srv import GraspBook, PlaceInBin
 
 import tf2_ros
-from tf2_geometry_msgs import do_transform_pose_stamped
+from cv_bridge import CvBridge
+from tf2_geometry_msgs import do_transform_point, do_transform_pose_stamped
 
 MOVEIT_SUCCESS = 1  # moveit_msgs/msg/MoveItErrorCodes.SUCCESS
+# Gazebo runs at ~0.13x real time on this GPU-less host; a 30s wall-clock wait
+# gave up on moves that were still executing.
+MOTION_TIMEOUT_SEC = 300.0
+LINEAR_TIME_SCALE = 3.0  # stretch straight-line trajectories near books/bin
+
+CAMERA_OPTICAL_FRAME = 'head_front_camera_color_optical_frame'
+BOOK_SETTLE_SEC = 1.5            # s, let head/arm stop before trusting a detection
+BOOK_REFRESH_TIMEOUT_SEC = 10.0
+BOOK_REAIM_MAX_SHIFT = 0.05      # m, bigger jump than this = not the same book
+# Pads straddle a 20mm book with ~18mm to spare each side; a book that moves
+# more than this while the hand goes in is being pushed, not straddled.
+BOOK_PUSH_TOLERANCE = 0.012      # m
 
 # arm_right is mounted on the right side of the torso -- /compute_ik testing
 # in Gazebo shows it can only reach roughly up to y=0.15m to the *left* of
@@ -148,7 +165,7 @@ TORSO_LIFT_MARGIN = 0.05        # m
 # The sim's torso tracks far slower than its URDF velocity limit (~60s for
 # the full 0.35m in testing), so wait on /joint_states, not a fixed sleep.
 TORSO_TOLERANCE = 0.01          # m
-TORSO_TIMEOUT_SEC = 90.0
+TORSO_TIMEOUT_SEC = 300.0  # wall time; sim runs ~0.13x real time
 
 GRIPPER_JOINT = 'gripper_right_finger_joint'
 GRIPPER_TOLERANCE = 0.003       # joint units
@@ -163,6 +180,34 @@ GRIPPER_TIMEOUT_SEC = 10.0
 # book's 20mm edge) held it, then it lifted cleanly with the gripper.
 GRIPPER_CLOSE_DURATION = 3      # s
 LIFT_AFTER_GRASP = 0.03         # m, raise off the shelf before pulling out
+
+# --- place_in_bin: perceived, not hardcoded ---
+# The bin is red (same hue as red books) and much bigger in view; it sits on
+# the table, so its rim and the table top are both measured from the head
+# camera's colour+depth before choosing a release height.
+COLOR_TOPIC = '/head_front_camera/head_front_camera/color/image_raw'
+DEPTH_TOPIC = '/head_front_camera/head_front_camera/depth/image_rect_raw'
+DEPTH_INFO_TOPIC = '/head_front_camera/head_front_camera/depth/camera_info'
+BIN_RED_RANGES = [((0, 100, 80), (10, 255, 255)), ((170, 100, 80), (180, 255, 255))]
+BIN_MIN_AREA_PX = 2500
+BIN_DEPTH = 0.56                # m, bin extent along the robot's forward axis (mesh)
+BIN_HEAD_TILT = -0.4            # rad, rim at ~0.95m a metre ahead is in view
+BOOK_HALF_HEIGHT = 0.125        # m, book hangs this far below the grasp point
+BOOK_CENTRE_AHEAD = 0.04        # m, book centre ahead of the grasp point (0.16m deep, gripped 0.04 in)
+DROP_CLEARANCE = 0.05           # m, book bottom above the rim at release
+BIN_HOVER_BACK = 0.15           # m, approach over the rim from this far back...
+BIN_HOVER_UP = 0.05             # m, ...and this far up
+BIN_RELEASE_TOOL_X = 0.60       # m, comfortable forward reach for arm_right_tool_link
+BIN_APPROACH_SPEED = 0.1        # m/s
+BIN_MIN_FRONT_RANGE = 0.12      # m, front LiDAR stop while closing in on the table
+
+# PAL's home for arm_right (tiago_pro_motions_general_arm_right.yaml); the
+# "default position" after the drop.
+ARM_RIGHT_HOME_WAYPOINTS = (
+    ((-1.8614, -1.6008, -0.34892, -1.9818, 0.10153, -1.2, 0.0), 3),
+    ((-0.26, -1.6008, -0.3489, -1.9818, 0.0, -1.2, 0.0), 6),
+    ((-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0), 9),
+)
 CENTERING_LINEAR_SPEED = 0.2    # m/s, mecanum-base lateral strafe command
 # Calibrated against odom: commanding 0.4m of strafe (at the speed/duration
 # above) only produced ~0.094m of *actual* lateral displacement -- severe
@@ -189,13 +234,9 @@ class ManipulationNode(Node):
         self.declare_parameter('planning_group', 'arm_right')
         self.declare_parameter('eef_link', 'arm_right_tool_link')
         self.declare_parameter('planning_frame', 'base_footprint')
-        self.declare_parameter('approach_dx', -0.15)
+        self.declare_parameter('approach_dx', -0.20)
         self.declare_parameter('approach_dy', 0.0)
         self.declare_parameter('approach_dz', 0.0)
-        # Fixed place pose (planning frame) -- see STILL TO TUNE above.
-        self.declare_parameter('place_x', 0.6)
-        self.declare_parameter('place_y', 0.0)
-        self.declare_parameter('place_z', 0.9)
         # 0.069 is the clamp's max; 0.04 only opened the fingertips ~61mm,
         # tight for sliding around a 20mm book with any lateral error.
         self.declare_parameter('gripper_open', 0.065)
@@ -213,11 +254,6 @@ class ManipulationNode(Node):
             self.get_parameter('approach_dy').value,
             self.get_parameter('approach_dz').value,
         )
-        self.place_xyz = (
-            self.get_parameter('place_x').value,
-            self.get_parameter('place_y').value,
-            self.get_parameter('place_z').value,
-        )
         self.gripper_open = self.get_parameter('gripper_open').value
         self.gripper_closed = self.get_parameter('gripper_closed').value
         self.pos_tol = self.get_parameter('position_tolerance').value
@@ -230,6 +266,10 @@ class ManipulationNode(Node):
         # --- MoveGroup action client (talks to the already-running move_group) ---
         self.move_group_client = ActionClient(
             self, MoveGroup, '/move_action', callback_group=cb_group)
+        self.cartesian_client = self.create_client(
+            GetCartesianPath, '/compute_cartesian_path', callback_group=cb_group)
+        self.execute_client = ActionClient(
+            self, ExecuteTrajectory, '/execute_trajectory', callback_group=cb_group)
 
         # --- Gripper: direct topic publish, matching the controller interface ---
         # NOTE: the spawned controller is gripper_right_controller_raw (see
@@ -242,6 +282,7 @@ class ManipulationNode(Node):
             JointTrajectory, '/torso_controller/joint_trajectory', 10)
         self.torso_position = None
         self.gripper_position = None
+        self.head_positions = None
         self.create_subscription(
             JointState, '/joint_states', self._on_joint_states, 10, callback_group=cb_group)
         self.odom_pose = None  # (x, y, yaw), for closed-loop strafing -- see _strafe_base
@@ -262,6 +303,22 @@ class ManipulationNode(Node):
             callback_group=cb_group)
         self.book_pose_pub = self.create_publisher(PoseStamped, '/erc/target_book_pose', 10)
 
+        self.bridge = CvBridge()
+        self.latest_color = None
+        self.latest_depth = None
+        self.depth_info = None
+        self.create_subscription(
+            Image, COLOR_TOPIC, lambda m: setattr(self, 'latest_color', m), 2, callback_group=cb_group)
+        self.create_subscription(
+            Image, DEPTH_TOPIC, lambda m: setattr(self, 'latest_depth', m), 2, callback_group=cb_group)
+        self.create_subscription(
+            CameraInfo, DEPTH_INFO_TOPIC, lambda m: setattr(self, 'depth_info', m), 2, callback_group=cb_group)
+        self.head_pub = self.create_publisher(JointTrajectory, '/head_controller/joint_trajectory', 10)
+        self.front_range = math.inf
+        self.create_subscription(LaserScan, '/scan_front_raw', self._on_scan, 10, callback_group=cb_group)
+        self.arm_right_pub = self.create_publisher(
+            JointTrajectory, '/arm_right_controller/joint_trajectory', 10)
+
         # --- Manipulation service contract (state_machine_node calls these) ---
         self.create_service(
             GraspBook, '/erc/grasp_book', self._on_grasp_book, callback_group=cb_group)
@@ -277,6 +334,9 @@ class ManipulationNode(Node):
             self.torso_position = msg.position[msg.name.index(TORSO_JOINT)]
         if GRIPPER_JOINT in msg.name:
             self.gripper_position = msg.position[msg.name.index(GRIPPER_JOINT)]
+        if 'head_1_joint' in msg.name and 'head_2_joint' in msg.name:
+            self.head_positions = (msg.position[msg.name.index('head_1_joint')],
+                                   msg.position[msg.name.index('head_2_joint')])
 
     def _set_torso(self, target) -> bool:
         target = max(TORSO_MIN, min(TORSO_MAX, target))
@@ -461,13 +521,59 @@ class ManipulationNode(Node):
         return constraints
 
     @staticmethod
-    def _block_on_future(future, timeout_sec=30.0, poll=0.02):
+    def _block_on_future(future, timeout_sec=MOTION_TIMEOUT_SEC, poll=0.02):
         deadline = time.monotonic() + timeout_sec
         while not future.done():
             if time.monotonic() > deadline:
                 return None
             time.sleep(poll)
         return future.result()
+
+    def move_linear(self, pose_stamped: PoseStamped) -> bool:
+        """Straight-line tool motion to pose_stamped (via /compute_cartesian_path
+        + /execute_trajectory). Used for every move near a book or the bin:
+        OMPL's joint-space plans between two nearby poses can still swing the
+        hand along a curve, which is how the gripper swept books over."""
+        if not self.cartesian_client.wait_for_service(timeout_sec=10.0):
+            self.get_logger().error('/compute_cartesian_path not available')
+            return False
+        req = GetCartesianPath.Request()
+        req.header.frame_id = pose_stamped.header.frame_id
+        req.group_name = self.planning_group
+        req.link_name = self.eef_link
+        req.waypoints = [pose_stamped.pose]
+        req.max_step = 0.01
+        req.jump_threshold = 0.0
+        req.avoid_collisions = True
+        req.start_state.is_diff = True
+        res = self._block_on_future(self.cartesian_client.call_async(req))
+        if res is None or res.fraction < 0.99:
+            self.get_logger().warn(
+                f'straight-line path only {0.0 if res is None else res.fraction:.0%} feasible')
+            return False
+
+        traj = res.solution
+        for point in traj.joint_trajectory.points:  # slow it down near objects
+            t = (point.time_from_start.sec + point.time_from_start.nanosec * 1e-9) * LINEAR_TIME_SCALE
+            point.time_from_start = Duration(seconds=t).to_msg()
+            point.velocities = [v / LINEAR_TIME_SCALE for v in point.velocities]
+            point.accelerations = [a / LINEAR_TIME_SCALE ** 2 for a in point.accelerations]
+
+        if not self.execute_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error('/execute_trajectory not available')
+            return False
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = traj
+        handle = self._block_on_future(self.execute_client.send_goal_async(goal))
+        if handle is None or not handle.accepted:
+            self.get_logger().warn('ExecuteTrajectory goal rejected')
+            return False
+        result = self._block_on_future(handle.get_result_async())
+        if result is None or result.result.error_code.val != MOVEIT_SUCCESS:
+            self.get_logger().warn(
+                f'straight-line execution failed ({None if result is None else result.result.error_code.val})')
+            return False
+        return True
 
     def move_to_pose(self, pose_stamped: PoseStamped) -> bool:
         """Blocking helper: plan AND execute a move to the given pose. Safe to
@@ -547,6 +653,56 @@ class ManipulationNode(Node):
         return self.gripper_position
 
     # ------------------------------------------------------------------
+    def _fresh_book_face(self, timeout_sec=BOOK_REFRESH_TIMEOUT_SEC):
+        """Book front face (x, y, z) in the planning frame from a detection
+        taken *after* this call, or None. Waits BOOK_SETTLE_SEC first so the
+        camera isn't mid-motion."""
+        time.sleep(BOOK_SETTLE_SEC)
+        since = self.get_clock().now().nanoseconds
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            pose = self.latest_book_pose
+            if pose is not None and rclpy.time.Time.from_msg(pose.header.stamp).nanoseconds >= since:
+                pose = self.transform_to_planning_frame(pose)
+                if pose is not None:
+                    p = pose.pose.position
+                    return (p.x, p.y, p.z)
+            time.sleep(0.05)
+        return None
+
+    def _look_at(self, point):
+        """Pan/tilt the head so `point` (planning frame) is at image centre --
+        detections are most accurate there, and book_detector picks the blob
+        nearest centre, so this also locks onto the intended book."""
+        if self.head_positions is None:
+            return
+        target = PointStamped()
+        target.header.frame_id = self.planning_frame
+        target.point.x, target.point.y, target.point.z = point
+        try:
+            tf = self.tf_buffer.lookup_transform(CAMERA_OPTICAL_FRAME, self.planning_frame, rclpy.time.Time())
+        except Exception as e:
+            self.get_logger().warn(f'look_at TF failed: {e}')
+            return
+        c = do_transform_point(target, tf).point
+        pan = self.head_positions[0] - math.atan2(c.x, c.z)
+        tilt = self.head_positions[1] - math.atan2(c.y, c.z)
+        msg = JointTrajectory()
+        msg.joint_names = ['head_1_joint', 'head_2_joint']
+        pt = JointTrajectoryPoint()
+        pt.positions = [pan, tilt]
+        pt.time_from_start.sec = 1
+        msg.points = [pt]
+        self.head_pub.publish(msg)
+
+    def _grasp_poses(self, face):
+        """(pregrasp, grasp) tool_link poses for a book front face."""
+        grasp = self.make_pose(
+            face[0] + GRASP_DEPTH - GRASPING_LINK_OFFSET, face[1], face[2],
+            self.planning_frame, *GRASP_ORIENTATION)
+        dx, dy, dz = self.approach_offset
+        return self.offset_pose(grasp, dx, dy, dz), grasp
+
     def _on_grasp_book(self, request, response):
         book_pose = self._wait_for_pose('latest_book_pose')
         if book_pose is None:
@@ -567,25 +723,13 @@ class ManipulationNode(Node):
                 response.message = (
                     'book stayed out of arm_right reach after centering the base on it')
                 return response
+        face = (book_pose.pose.position.x, book_pose.pose.position.y, book_pose.pose.position.z)
 
-        # Overwrite whatever orientation came through the point->pose->TF
-        # chain (effectively identity) with the grasp orientation -- see
-        # GRASP_ORIENTATION above for why identity doesn't actually work.
-        book_pose.pose.orientation.x = GRASP_ORIENTATION[0]
-        book_pose.pose.orientation.y = GRASP_ORIENTATION[1]
-        book_pose.pose.orientation.z = GRASP_ORIENTATION[2]
-        book_pose.pose.orientation.w = GRASP_ORIENTATION[3]
-        book_pose.pose.position.x += GRASP_DEPTH - GRASPING_LINK_OFFSET
-
-        dx, dy, dz = self.approach_offset
-        pregrasp = self.offset_pose(book_pose, dx, dy, dz)
-
-        lift = max(TORSO_DEFAULT,
-                   book_pose.pose.position.z - REACH_Z_AT_ZERO_LIFT + TORSO_LIFT_MARGIN)
+        # 1. Raise the body for the book's row before reaching.
+        lift = max(TORSO_DEFAULT, face[2] - REACH_Z_AT_ZERO_LIFT + TORSO_LIFT_MARGIN)
         if lift > TORSO_MAX:
             response.success = False
-            response.message = (
-                f'book at z={book_pose.pose.position.z:.2f}m is above reach even at full torso lift')
+            response.message = f'book at z={face[2]:.2f}m is above reach even at full torso lift'
             return response
         if not self._set_torso(lift):
             response.success = False
@@ -593,66 +737,291 @@ class ManipulationNode(Node):
             return response
 
         try:
+            # 2. Re-measure with the head aimed at the book (camera moved with the torso).
+            self._look_at(face)
+            refined = self._fresh_book_face()
+            if refined is None:
+                response.success = False
+                response.message = 'lost the book after raising the torso'
+                return response
+            self.get_logger().info(f'book face {face} -> refined {tuple(round(v, 3) for v in refined)}')
+            face = refined
+
             opened = self.set_gripper(self.gripper_open)
             if opened is None or abs(opened - self.gripper_open) > GRIPPER_TOLERANCE * 3:
                 response.success = False
                 response.message = f'gripper did not open (at {opened}); not approaching the book'
                 return response
 
+            pregrasp, grasp = self._grasp_poses(face)
             if not self.move_to_pose(pregrasp):
                 response.success = False
                 response.message = 'failed to plan/move to pre-grasp hover pose'
                 return response
 
-            if not self.move_to_pose(book_pose):
+            # 3. Close-range check from the hover point; re-aim if it's the
+            # same book, abort if it isn't where we thought.
+            self._look_at(face)
+            close = self._fresh_book_face()
+            if close is not None:
+                shift = math.dist(close, face)
+                if shift > BOOK_REAIM_MAX_SHIFT:
+                    response.success = False
+                    response.message = f'book seen {shift:.3f}m from its earlier position; not reaching'
+                    return response
+                face = close
+                pregrasp, grasp = self._grasp_poses(face)
+                if not self.move_linear(pregrasp):
+                    response.success = False
+                    response.message = 'failed to re-align at the pre-grasp pose'
+                    return response
+            else:
+                self.get_logger().warn('book not visible from the hover pose; using the earlier fix')
+
+            # 4. Straight in, then confirm the book didn't get pushed before closing.
+            if not self.move_linear(grasp):
                 response.success = False
-                response.message = 'failed to plan/move to grasp pose'
+                response.message = 'failed to move in to the grasp pose'
+                return response
+            after = self._fresh_book_face()
+            if after is not None and (abs(after[0] - face[0]) > BOOK_PUSH_TOLERANCE
+                                      or abs(after[1] - face[1]) > BOOK_PUSH_TOLERANCE):
+                self.move_linear(pregrasp)
+                response.success = False
+                response.message = (
+                    f'book moved while reaching in (dx={after[0] - face[0]:+.3f} '
+                    f'dy={after[1] - face[1]:+.3f}); backed out without closing')
                 return response
 
+            # 5. Squeeze gently, lift off the shelf, pull straight out.
             closed = self.set_gripper(self.gripper_closed, duration_sec=GRIPPER_CLOSE_DURATION)
             if closed is None:
                 response.success = False
                 response.message = 'no gripper feedback after closing'
                 return response
-
-            lifted = self.offset_pose(book_pose, 0.0, 0.0, LIFT_AFTER_GRASP)
-            if not self.move_to_pose(lifted):
+            if not self.move_linear(self.offset_pose(grasp, 0.0, 0.0, LIFT_AFTER_GRASP)):
                 response.success = False
                 response.message = 'closed on the book but failed to lift it off the shelf'
                 return response
-            self.move_to_pose(self.offset_pose(pregrasp, 0.0, 0.0, LIFT_AFTER_GRASP))  # retreat; best-effort
+            self.move_linear(self.offset_pose(pregrasp, 0.0, 0.0, LIFT_AFTER_GRASP))
         finally:
             self._set_torso(TORSO_DEFAULT)
+            self._set_head_tilt(0.0)
 
         response.success = True
         response.message = 'book grasped'
         return response
 
+    def _perceive_bin(self):
+        """Find the red bin in the head camera and measure it in the planning
+        frame: rim height, centre, and the table top it sits on. Returns a
+        dict or None. Uses the same colour+depth back-projection as
+        book_detector (depth and colour are both 640x360 and line up)."""
+        self._set_head_tilt(BIN_HEAD_TILT)
+        time.sleep(2.0)
+        color_msg, depth_msg, info = self.latest_color, self.latest_depth, self.depth_info
+        if color_msg is None or depth_msg is None or info is None:
+            self.get_logger().warn('no colour/depth frames for bin perception')
+            return None
+        color = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
+        depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough').astype(np.float32)
+        if depth_msg.encoding == '16UC1':
+            depth /= 1000.0
+
+        hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lower, upper in BIN_RED_RANGES:
+            mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = [c for c in contours if cv2.contourArea(c) >= BIN_MIN_AREA_PX]
+        if not contours:
+            self.get_logger().warn('bin not visible (no large red blob)')
+            return None
+        blob = max(contours, key=cv2.contourArea)
+        bx, by, bw, bh = cv2.boundingRect(blob)
+        bin_mask = np.zeros_like(mask)
+        cv2.drawContours(bin_mask, [blob], -1, 255, thickness=cv2.FILLED)
+        bin_mask &= mask
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.planning_frame, depth_msg.header.frame_id, rclpy.time.Time())
+        except Exception as e:
+            self.get_logger().warn(f'TF for bin perception failed: {e}')
+            return None
+        q = tf.transform.rotation
+        rot = np.array([
+            [1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.z * q.w), 2 * (q.x * q.z + q.y * q.w)],
+            [2 * (q.x * q.y + q.z * q.w), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.x * q.w)],
+            [2 * (q.x * q.z - q.y * q.w), 2 * (q.y * q.z + q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y)]])
+        trans = np.array([tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z])
+        fx, fy, cx, cy = info.k[0], info.k[4], info.k[2], info.k[5]
+
+        def project(pixel_mask):
+            vs, us = np.nonzero(pixel_mask)
+            d = depth[vs, us]
+            ok = np.isfinite(d) & (d > 0.1) & (d < 4.0)
+            vs, us, d = vs[ok], us[ok], d[ok]
+            cam = np.stack([(us - cx) * d / fx, (vs - cy) * d / fy, d], axis=1)
+            return cam @ rot.T + trans
+
+        bin_pts = project(bin_mask)
+        if len(bin_pts) < 50:
+            self.get_logger().warn(f'too few bin depth points ({len(bin_pts)})')
+            return None
+
+        # Table: the non-red pixels just below the bin in the image are the
+        # table top in front of it.
+        below = np.zeros_like(mask)
+        below[by + bh:min(by + bh + max(bh, 20), below.shape[0]), bx:bx + bw] = 255
+        below &= cv2.bitwise_not(mask)
+        table_pts = project(below)
+
+        rim_z = float(np.percentile(bin_pts[:, 2], 98))
+        bin_y = float(np.median(bin_pts[:, 1]))
+        front_x = float(np.percentile(bin_pts[:, 0], 3))
+        back_x = float(np.percentile(bin_pts[:, 0], 97))
+        centre_x = (front_x + back_x) / 2 if back_x - front_x > BIN_DEPTH * 0.7 else front_x + BIN_DEPTH / 2
+        table_z = None
+        if len(table_pts) >= 20:
+            candidates = table_pts[(table_pts[:, 2] > 0.3) & (table_pts[:, 2] < rim_z - 0.05)]
+            if len(candidates) >= 20:
+                table_z = float(np.percentile(candidates[:, 2], 90))
+        self.get_logger().info(
+            f'bin perceived: rim z={rim_z:.3f} centre=({centre_x:.3f},{bin_y:.3f}) '
+            f'front x={front_x:.3f} table z={table_z if table_z is None else round(table_z, 3)} '
+            f'({len(bin_pts)} bin pts)')
+        return {'rim_z': rim_z, 'centre_x': centre_x, 'centre_y': bin_y, 'table_z': table_z}
+
+    def _set_head_tilt(self, tilt):
+        msg = JointTrajectory()
+        msg.joint_names = ['head_1_joint', 'head_2_joint']
+        point = JointTrajectoryPoint()
+        point.positions = [0.0, tilt]
+        point.time_from_start.sec = 1
+        msg.points = [point]
+        self.head_pub.publish(msg)
+
+    def _go_home(self):
+        """Right arm back to PAL's home pose (left arm is already tucked by
+        navigation_node), torso to default, base held still."""
+        msg = JointTrajectory()
+        msg.joint_names = [f'arm_right_{i}_joint' for i in range(1, 8)]
+        for positions, t in ARM_RIGHT_HOME_WAYPOINTS:
+            point = JointTrajectoryPoint()
+            point.positions = list(positions)
+            point.time_from_start.sec = t
+            msg.points.append(point)
+        self.arm_right_pub.publish(msg)
+        time.sleep(ARM_RIGHT_HOME_WAYPOINTS[-1][1] + 2.0)
+        self._set_torso(TORSO_DEFAULT)
+        self._set_head_tilt(0.0)
+        self.cmd_vel_pub.publish(Twist())
+
+    def _on_scan(self, msg: LaserScan):
+        ranges = [
+            d for i, d in enumerate(msg.ranges)
+            if abs(math.atan2(math.sin(msg.angle_min + i * msg.angle_increment),
+                              math.cos(msg.angle_min + i * msg.angle_increment))) <= math.radians(20)
+            and msg.range_min <= d <= msg.range_max]
+        self.front_range = min(ranges) if ranges else math.inf
+
+    def _drive_straight(self, distance) -> float:
+        """Closed-loop on /odom (same reason as _strafe_base), stopping early
+        if the front LiDAR gets within BIN_MIN_FRONT_RANGE. Returns the
+        distance actually covered (signed)."""
+        if self.odom_pose is None:
+            return 0.0
+        sx, sy, syaw = self.odom_pose
+        cmd = Twist()
+        cmd.linear.x = math.copysign(BIN_APPROACH_SPEED, distance)
+        deadline = time.monotonic() + CENTERING_TIMEOUT_SEC + abs(distance) / BIN_APPROACH_SPEED * 3
+        moved = 0.0
+        while time.monotonic() < deadline:
+            x, y, _ = self.odom_pose
+            moved = (x - sx) * math.cos(syaw) + (y - sy) * math.sin(syaw)
+            if abs(moved) >= abs(distance) - 0.01:
+                break
+            if distance > 0 and self.front_range < BIN_MIN_FRONT_RANGE:
+                self.get_logger().warn(f'front range {self.front_range:.2f}m -- stopping approach to the bin')
+                break
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(0.05)
+        for _ in range(3):
+            self.cmd_vel_pub.publish(Twist())
+            time.sleep(0.05)
+        return moved
+
     def _on_place_in_bin(self, request, response):
-        # Fixed pose, not a live point -- see module docstring.
-        px, py, pz = self.place_xyz
-        bin_pose = self.make_pose(
-            px - GRASPING_LINK_OFFSET, py, pz, self.planning_frame, *GRASP_ORIENTATION)
-        dx, dy, dz = self.approach_offset
-        hover = self.offset_pose(bin_pose, dx, dy, dz)
-
-        if not self.move_to_pose(hover):
+        self.cmd_vel_pub.publish(Twist())
+        bin_info = self._perceive_bin()
+        if bin_info is None:
             response.success = False
-            response.message = 'failed to plan/move above the bin'
+            response.message = 'could not perceive the bin (need it in the head camera)'
+            return response
+        table_z = bin_info['table_z']
+        if table_z is not None and bin_info['rim_z'] < table_z + 0.08:
+            response.success = False
+            response.message = f"bin rim z={bin_info['rim_z']:.2f} not clearly above table z={table_z:.2f}"
             return response
 
-        if not self.move_to_pose(bin_pose):
+        # The book hangs about half its height below the grasp point, so hold
+        # the grasp point that far above the rim, plus clearance -- this is
+        # also well above the table top, which the rim sits on.
+        release_z = bin_info['rim_z'] + BOOK_HALF_HEIGHT + DROP_CLEARANCE
+        # Book centre is BOOK_CENTRE_AHEAD in front of the grasp point.
+        release_tool_x = BIN_RELEASE_TOOL_X
+        book_centre_x = release_tool_x + GRASPING_LINK_OFFSET + BOOK_CENTRE_AHEAD
+        advance = bin_info['centre_x'] - book_centre_x
+
+        def tool_pose(x, z):
+            return self.make_pose(x, bin_info['centre_y'], z, self.planning_frame, *GRASP_ORIENTATION)
+
+        # 1. Lift the book above the rim *before* getting near the table.
+        carry = tool_pose(release_tool_x - BIN_HOVER_BACK, release_z + BIN_HOVER_UP)
+        lift = max(TORSO_DEFAULT, carry.pose.position.z - REACH_Z_AT_ZERO_LIFT + TORSO_LIFT_MARGIN)
+        if lift > TORSO_MAX:
             response.success = False
-            response.message = 'failed to plan/move down into the bin'
+            response.message = f'release height z={release_z:.2f}m is above reach even at full torso lift'
+            return response
+        if not self._set_torso(lift):
+            response.success = False
+            response.message = 'torso failed to reach the lift height for the bin'
+            return response
+        if not (self.move_linear(carry) or self.move_to_pose(carry)):
+            response.success = False
+            response.message = 'failed to raise the book above bin height'
             return response
 
-        self.set_gripper(self.gripper_open)
-        self.move_to_pose(hover)  # retreat; best-effort
+        # 2. Now close the gap to the table with the book held high.
+        moved = 0.0
+        if advance > 0.02:
+            moved = self._drive_straight(advance)
+            self.get_logger().info(f'advanced {moved:.3f}m of {advance:.3f}m toward the bin')
+        shortfall = advance - moved  # bin is still this much further than planned
+        release_tool_x += max(0.0, shortfall)
+
+        # 3. Over the rim, drop, and pull the hand back out.
+        over = tool_pose(release_tool_x, release_z)
+        if not self.move_linear(over):
+            self._drive_straight(-moved)
+            self._go_home()
+            response.success = False
+            response.message = 'failed to reach over the bin (backed off, arm home)'
+            return response
+        self.set_gripper(self.gripper_open, duration_sec=2)
+        time.sleep(1.0)  # let the book fall clear before moving the hand
+        self.move_linear(tool_pose(release_tool_x - BIN_HOVER_BACK, release_z + BIN_HOVER_UP))
+
+        # 4. Back away from the table, return to default, and stay put.
+        self._drive_straight(-moved)
+        self._go_home()
 
         response.success = True
-        response.message = 'book placed in bin'
+        response.message = (
+            f"book released over bin (rim z={bin_info['rim_z']:.2f}, table z="
+            f"{'?' if table_z is None else round(table_z, 2)}); arm home, stopped")
         return response
-
 
 def main(args=None):
     rclpy.init(args=args)
