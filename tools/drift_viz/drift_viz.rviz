@@ -1,0 +1,135 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Help Height: 0
+    Tree Height: 400
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid (1 m)
+      Enabled: true
+      Reference Frame: <Fixed Frame>
+      Cell Size: 1
+      Plane Cell Count: 14
+      Color: 150; 150; 155
+      Alpha: 0.45
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Value: true
+    - Class: rviz_default_plugins/RobotModel
+      Name: Robot
+      Enabled: true
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Alpha: 0.55
+      Visual Enabled: true
+      Collision Enabled: false
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: Odometry path (/odom)
+      Enabled: true
+      Topic:
+        Value: /drift_viz/odom_path
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Color: 255; 150; 20
+      Line Style: Billboards
+      Line Width: 0.045
+      Alpha: 1
+      Buffer Length: 1
+      Pose Style: None
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: Ground truth path (Gazebo)
+      Enabled: true
+      Topic:
+        Value: /drift_viz/true_path
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Color: 40; 210; 110
+      Line Style: Billboards
+      Line Width: 0.045
+      Alpha: 1
+      Buffer Length: 1
+      Pose Style: None
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Planned waypoints + drift
+      Enabled: true
+      Topic:
+        Value: /drift_viz/markers
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Namespaces: {}
+      Value: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: Front LiDAR
+      Enabled: true
+      Topic:
+        Value: /scan_front_raw
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+      Color Transformer: FlatColor
+      Color: 130; 140; 230
+      Size (m): 0.03
+      Style: Points
+      Alpha: 0.7
+      Decay Time: 0
+      Queue Size: 10
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 34; 36; 40
+    Fixed Frame: odom
+    Frame Rate: 15
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Measure
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      Angle: 0
+      Scale: 105
+      X: 0
+      Y: -1.2
+      Near Clip Distance: 0.01
+      Invert Z Axis: false
+      Target Frame: <Fixed Frame>
+      Value: TopDownOrtho (rviz_default_plugins)
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Width: 1280
+  X: 40
+  Y: 40
+  Hide Left Dock: false
+  Hide Right Dock: true
