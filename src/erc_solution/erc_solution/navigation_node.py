@@ -42,6 +42,13 @@ def world_xy_to_odom(world_x, world_y):
 
 BIN_WAYPOINT = (*world_xy_to_odom(BIN_X + BIN_STANDOFF, BIN_Y), math.pi - TRUE_YAW_MINUS_ODOM_YAW)
 
+# World heading 0 (facing the shelf, world +X) in odom yaw -- same
+# TRUE_YAW_MINUS_ODOM_YAW rotation BIN_WAYPOINT's heading above uses.
+# Squaring up to this before approach_shelf's forward drive keeps the
+# LiDAR-measured standoff distance consistent regardless of which way the
+# column-centering spin happened to leave the robot facing.
+SHELF_FACING_ODOM_YAW = -TRUE_YAW_MINUS_ODOM_YAW
+
 POSITION_TOLERANCE = 0.5       # m
 YAW_TOLERANCE = 0.25           # rad, final heading just needs to be roughly right
 MAX_LINEAR_SPEED = 1.0         # m/s, straight-line driving holds up fine at speed
@@ -159,11 +166,39 @@ class NavigationNode(Node):
         return min(abs(v) for v in self.wheel_velocities.values())
 
     def _approach_shelf_cb(self, request, response):
-        """No waypoint math, no odom position target - state_machine_node
-        has already spun until perception confirmed the target column, so
-        the shelf is roughly dead ahead. Just drive straight forward until
-        the front LiDAR says we're within SHELF_STANDOFF or the safety
-        timeout hits, then tilt the head down for book detection."""
+        """state_machine_node has already spun until perception confirmed
+        the target column, but that only guarantees the CAMERA is pointed
+        at the marker -- not that the robot's body is square to the shelf
+        face. A narrow-cone front-LiDAR stop from an off-angle approach
+        measures a shorter or longer distance than the true standoff (seen:
+        successful grasps around 1.3m from the shelf, a bad one at 2.2m
+        with an otherwise-identical setup). Explicitly rotate to
+        SHELF_FACING_ODOM_YAW (the heading confirmed square to the shelf in
+        testing) before driving in, so distance-to-target is consistent
+        run to run instead of depending on wherever the centering spin
+        happened to stop.
+
+        self.pose can still be None here: normally SEEK_COLUMN's spin has
+        been running for a while first, giving /odom plenty of time to
+        publish, but the debug_skip_column_search bypass calls this almost
+        immediately after node startup -- a real race with the first /odom
+        message. Silently skipping the rotation in that case meant the
+        robot just drove forward in whatever direction it happened to
+        spawn facing, not toward the shelf at all -- confirmed live via
+        gz's own ground-truth pose topic: ended up ~4m off to the side,
+        90deg off from the shelf-facing heading, 100% reproducible with
+        the bypass. Wait briefly for the first /odom message instead of
+        skipping outright."""
+        wait_deadline = time.time() + 3.0
+        while self.pose is None and time.time() < wait_deadline:
+            time.sleep(0.05)
+        if self.pose is not None:
+            self._rotate_to_heading(SHELF_FACING_ODOM_YAW)
+        else:
+            self.get_logger().warn(
+                'approach_shelf: no /odom message received after 3s -- '
+                'driving forward without a heading correction')
+
         cmd = Twist()
         cmd.linear.x = APPROACH_LINEAR_SPEED
         deadline = self.get_clock().now().nanoseconds / 1e9 + APPROACH_TIMEOUT
@@ -178,6 +213,22 @@ class NavigationNode(Node):
         response.success = True
         response.message = f'approached to front_min_range={self.front_min_range:.2f}m'
         return response
+
+    def _rotate_to_heading(self, target_yaw, timeout_sec=6.0):
+        """Blocking in-place rotation to a known odom yaw, P-controlled
+        (same gains as _drive_to_waypoint's ROTATE phase). Best-effort --
+        callers should already have self.pose set."""
+        deadline = self.get_clock().now().nanoseconds / 1e9 + timeout_sec
+        while self.get_clock().now().nanoseconds / 1e9 < deadline:
+            _, _, yaw = self.pose
+            yaw_error = normalize_angle(target_yaw - yaw)
+            if abs(yaw_error) <= YAW_TOLERANCE:
+                break
+            cmd = Twist()
+            cmd.angular.z = clamp(KP_ANGULAR * yaw_error, MAX_ANGULAR_SPEED)
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(CONTROL_PERIOD)
+        self.cmd_vel_pub.publish(Twist())
 
     def _navigate_to_bin_cb(self, request, response):
         response = self._drive_to_waypoint(BIN_WAYPOINT, response)

@@ -16,13 +16,38 @@ CAMERA_TOPIC = '/head_front_camera/head_front_camera/color/image_raw'
 MARKER_BAND_TOP_FRACTION = 0.05
 MARKER_BAND_BOTTOM_FRACTION = 0.60
 SAVE_INTERVAL_SEC = 2.0
-CENTER_TOLERANCE_FRACTION = 0.035  # matches state_machine_node's CENTER_LOCK_TOLERANCE
+CENTER_TOLERANCE_FRACTION = 0.06  # matches state_machine_node's CENTER_LOCK_TOLERANCE.
+                                   # Was 0.035 -- live testing showed the state
+                                   # machine's tracking correction (even after
+                                   # speeding it up) rarely lands two
+                                   # consecutive OCR frames inside that tight a
+                                   # band under this sim's wheel slip, causing
+                                   # column-lock to keep timing out and
+                                   # restarting the search sweep.
 REQUIRED_CENTERED_FRAMES = 2
 GLYPH_THRESHOLD = 160
 MIN_GLYPH_AREA = 80
 NORMALIZED_GLYPH_SIZE = (64, 96)
-MAX_TEMPLATE_DIFFERENCE = 0.27
-MIN_TEMPLATE_MARGIN = 0.06
+# 0.27/0.06 (first values tried) worked for digits 1/3/5 but never passed for
+# digit "2" at all -- measured directly: captured 15 live frames of the real
+# "2" marker mid-search and ran this exact scoring offline. At the range
+# SEEK_COLUMN operates from, the live glyph crop is only ~20x19px (vs. the
+# template's native ~111x133px), and "2"'s curved strokes lose far more
+# shape fidelity than "1"'s straight stroke at that resolution -- its best
+# score consistently landed at 0.35-0.44, never once under 0.27, even though
+# it was *still always the correct top-ranked digit* (large margin over the
+# 2nd-best candidate in nearly every frame). Tried smoothing the resize
+# (INTER_AREA on a continuous-valued mask instead of hard threshold +
+# INTER_NEAREST) first -- barely moved the score, confirming this is a real
+# pixel-resolution limit, not a quantization artifact. Widened both
+# thresholds to comfortably cover digit "2"'s observed range while staying
+# below the ~0.5+ scores seen for genuinely wrong/junk candidates.
+MAX_TEMPLATE_DIFFERENCE = 0.40
+MIN_TEMPLATE_MARGIN = 0.03
+# Separately, digit "5" needed an even looser margin than the (already
+# widened) global default in a teammate's own live testing -- layer that
+# on top rather than choosing between the two fixes, since they address
+# different digits' distinct matching problems.
 MIN_TEMPLATE_MARGIN_BY_DIGIT = {5: 0.015}
 
 MAX_DIGIT_WIDTH_FRACTION = 0.15
