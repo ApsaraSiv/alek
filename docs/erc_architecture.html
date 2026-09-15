@@ -1,0 +1,773 @@
+<!doctype html>
+<title>ERC Solution Architecture</title>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F5F6F3;
+    --panel: #FFFFFF;
+    --panel-edge: #E4E7E1;
+    --ink: #1B1F1D;
+    --muted: #666F68;
+    --line: #C9CEC7;
+    --line-strong: #9CA69D;
+
+    --perception: #0F7A7A;
+    --perception-soft: #E4F2F1;
+    --navigation: #A8611F;
+    --navigation-soft: #F6ECE0;
+    --manipulation: #654098;
+    --manipulation-soft: #EEE7F5;
+    --integration: #384049;
+    --integration-soft: #E7E9EB;
+    --substrate: #3F6B45;
+    --substrate-soft: #E5EDE3;
+    --moveit: #2C5A80;
+    --moveit-soft: #E3EBF1;
+    --danger: #9A3B3B;
+
+    color-scheme: light dark;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171A;
+      --panel: #1B1F23;
+      --panel-edge: #2C3238;
+      --ink: #E7EAE6;
+      --muted: #9AA39B;
+      --line: #34393D;
+      --line-strong: #4A5158;
+
+      --perception: #4FC2B8;
+      --perception-soft: #16302E;
+      --navigation: #E39A56;
+      --navigation-soft: #33271A;
+      --manipulation: #B79AE0;
+      --manipulation-soft: #2A2138;
+      --integration: #AEB6BE;
+      --integration-soft: #262A2F;
+      --substrate: #86C08C;
+      --substrate-soft: #1E2A1F;
+      --moveit: #7CB0D9;
+      --moveit-soft: #1C2A34;
+      --danger: #D98080;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #14171A;
+    --panel: #1B1F23;
+    --panel-edge: #2C3238;
+    --ink: #E7EAE6;
+    --muted: #9AA39B;
+    --line: #34393D;
+    --line-strong: #4A5158;
+
+    --perception: #4FC2B8;
+    --perception-soft: #16302E;
+    --navigation: #E39A56;
+    --navigation-soft: #33271A;
+    --manipulation: #B79AE0;
+    --manipulation-soft: #2A2138;
+    --integration: #AEB6BE;
+    --integration-soft: #262A2F;
+    --substrate: #86C08C;
+    --substrate-soft: #1E2A1F;
+    --moveit: #7CB0D9;
+    --moveit-soft: #1C2A34;
+    --danger: #D98080;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    padding: 32px 20px 64px;
+  }
+  img { max-width: 100%; }
+  [hidden] { display: none !important; }
+
+  code, .mono, .topic { font-family: "IBM Plex Mono", ui-monospace, "SF Mono", monospace; }
+
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 40px;
+  }
+
+  header.page-head {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 760px;
+  }
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  h1 {
+    font-size: clamp(26px, 4vw, 34px);
+    line-height: 1.15;
+    margin: 0;
+    font-weight: 700;
+    text-wrap: balance;
+  }
+  .lede {
+    color: var(--muted);
+    font-size: 15.5px;
+    max-width: 62ch;
+  }
+
+  section { display: flex; flex-direction: column; gap: 14px; }
+  h2 {
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h2::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--line);
+  }
+
+  .diagram-shell {
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 14px;
+    padding: 18px 18px 14px;
+    overflow-x: auto;
+  }
+  .diagram-shell svg { display: block; width: 100%; height: auto; min-width: 720px; }
+  figcaption {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 10px;
+    max-width: 76ch;
+  }
+
+  /* --- SVG node/edge styling, theme-driven --- */
+  .node-box { fill: var(--panel); stroke-width: 1.6; }
+  .node-title { font-family: "IBM Plex Mono", monospace; font-weight: 600; font-size: 13.5px; fill: var(--ink); }
+  .node-sub { font-family: "IBM Plex Sans", sans-serif; font-size: 10.5px; fill: var(--muted); }
+  .band-label { font-family: "IBM Plex Mono", monospace; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
+  .edge-label { font-family: "IBM Plex Mono", monospace; font-size: 10.3px; }
+  .edge-label-bg { fill: var(--panel); }
+  .group-label { font-family: "IBM Plex Sans", sans-serif; font-size: 10px; fill: var(--muted); font-style: italic; }
+
+  .c-perception   { stroke: var(--perception); fill: var(--perception); }
+  .c-navigation   { stroke: var(--navigation); fill: var(--navigation); }
+  .c-manipulation { stroke: var(--manipulation); fill: var(--manipulation); }
+  .c-integration  { stroke: var(--integration); fill: var(--integration); }
+  .c-substrate    { stroke: var(--substrate); fill: var(--substrate); }
+  .c-moveit       { stroke: var(--moveit); fill: var(--moveit); }
+
+  .fill-perception   { fill: var(--perception-soft); }
+  .fill-navigation   { fill: var(--navigation-soft); }
+  .fill-manipulation { fill: var(--manipulation-soft); }
+  .fill-integration  { fill: var(--integration-soft); }
+  .fill-substrate    { fill: var(--substrate-soft); }
+  .fill-moveit       { fill: var(--moveit-soft); }
+
+  .edge { fill: none; stroke-width: 1.8; }
+  .edge-feedback { fill: none; stroke-width: 1.3; stroke-dasharray: 1 4; stroke-linecap: round; }
+  .edge-service { fill: none; stroke-width: 1.6; stroke-dasharray: 6 4; }
+  .edge-orphan { fill: none; stroke-width: 1.4; stroke-dasharray: 2 3; }
+  text { fill: var(--ink); }
+  .legend-text { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; fill: var(--muted); }
+
+  /* --- role cards --- */
+  .roles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 860px) { .roles { grid-template-columns: 1fr; } }
+  .role-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 12px;
+    padding: 18px 20px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    border-top: 3px solid var(--accent);
+  }
+  .role-card.perception   { --accent: var(--perception); }
+  .role-card.navigation   { --accent: var(--navigation); }
+  .role-card.manipulation { --accent: var(--manipulation); }
+  .role-name {
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .role-pkg {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .role-card p { margin: 0; font-size: 14px; }
+  .role-card ul { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+  .role-card li { font-size: 12.6px; display: flex; gap: 8px; align-items: baseline; }
+  .role-card li .kind {
+    flex: 0 0 auto;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+  .role-card li .topic { color: var(--ink); word-break: break-word; }
+  .role-note {
+    margin-top: 2px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--line);
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+
+  .notes {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+  }
+  @media (max-width: 700px) { .notes { grid-template-columns: 1fr; } }
+  .note {
+    background: var(--integration-soft);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .note .note-head {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--integration);
+    font-weight: 600;
+  }
+
+  footer {
+    color: var(--muted);
+    font-size: 12.5px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+  }
+  footer code { color: var(--ink); }
+</style>
+
+<div class="wrap">
+
+  <header class="page-head">
+    <div class="eyebrow">erc_sim_2026 &middot; erc_solution / erc_perception</div>
+    <h1>How the library-robot's ROS 2 nodes fit together</h1>
+    <p class="lede">
+      TIAGo Pro finds a shelf column, reads a book off it, and carries it to the
+      collection bin. Seven nodes across two packages divide that job into
+      perception, navigation, manipulation, and one orchestrator that calls into
+      the other three — plus MoveIt and Gazebo underneath, which none of the
+      team's own nodes replace.
+    </p>
+  </header>
+
+  <section>
+    <h2>System architecture</h2>
+    <div class="diagram-shell">
+      <svg viewBox="0 0 1200 900" role="img" aria-label="Node graph: four perception nodes read the camera and depth feed; shelf_number_detector and book_color_detector publish column and row identification to state_machine_node, while book_detector publishes target_book_point directly to manipulation_node, bypassing the state machine; bin_detector's output is published but never consumed. state_machine_node calls navigation_node's approach_shelf and navigate_to_bin services and manipulation_node's grasp_book and place_in_bin services, and also drives cmd_vel and the head directly during its own column-search spin. navigation_node and manipulation_node command Gazebo and ros2_control directly; manipulation_node also delegates arm_right execution to MoveIt's move_group, which drives the arm_right controller on its own.">
+
+        <!-- ============ band labels ============ -->
+        <text x="30" y="46" class="band-label c-perception">PERCEPTION</text>
+        <text x="30" y="236" class="band-label c-integration">ORCHESTRATION</text>
+        <text x="30" y="726" class="band-label c-substrate">SIMULATION &amp; HARDWARE INTERFACE</text>
+
+        <!-- ============ camera bus (Gazebo -> all perception) ============ -->
+        <path d="M 450 700 L 450 178" class="edge c-substrate" marker-end="url(#arrow-substrate)"/>
+        <path d="M 185 178 L 745 178" class="edge c-substrate"/>
+        <path d="M 185 178 L 185 158" class="edge c-substrate" marker-end="url(#arrow-substrate)"/>
+        <path d="M 465 178 L 465 158" class="edge c-substrate" marker-end="url(#arrow-substrate)"/>
+        <path d="M 745 178 L 745 158" class="edge c-substrate" marker-end="url(#arrow-substrate)"/>
+        <path d="M 1025 178 L 1025 158" class="edge c-substrate" marker-end="url(#arrow-substrate)"/>
+        <path d="M 465 700 Q 500 440 725 178" class="edge-feedback c-substrate" marker-end="url(#arrow-substrate)"/>
+        <rect x="330" y="184" width="230" height="15" class="edge-label-bg"/>
+        <text x="333" y="195" class="edge-label c-substrate">color image &middot; all 4 nodes</text>
+        <rect x="590" y="140" width="100" height="15" class="edge-label-bg"/>
+        <text x="593" y="151" class="edge-label c-substrate">+ depth</text>
+
+        <!-- ============ PERCEPTION band ============ -->
+        <g>
+          <rect x="60"  y="60" width="250" height="98" rx="8" class="node-box c-perception"/>
+          <text x="76" y="86"  class="node-title">shelf_number_detector</text>
+          <text x="76" y="103" class="node-sub">OCR digit match on column plate</text>
+          <text x="76" y="118" class="node-sub">against the templates in erc_description</text>
+          <text x="76" y="141" class="group-label">erc_perception</text>
+        </g>
+        <g>
+          <rect x="340" y="60" width="250" height="98" rx="8" class="node-box c-perception"/>
+          <text x="356" y="86" class="node-title">book_color_detector</text>
+          <text x="356" y="103" class="node-sub">HSV blob per colour, row = which</text>
+          <text x="356" y="118" class="node-sub">image quarter the blob centres in</text>
+          <text x="356" y="141" class="group-label">erc_perception</text>
+        </g>
+        <g>
+          <rect x="620" y="60" width="250" height="98" rx="8" class="node-box c-perception"/>
+          <text x="636" y="86" class="node-title">book_detector</text>
+          <text x="636" y="103" class="node-sub">same HSV blob, back-projected</text>
+          <text x="636" y="118" class="node-sub">through depth to a real 3D point</text>
+          <text x="636" y="141" class="group-label">erc_solution</text>
+        </g>
+        <g>
+          <rect x="900" y="60" width="240" height="98" rx="8" class="node-box c-perception"/>
+          <text x="916" y="86" class="node-title">bin_detector</text>
+          <text x="916" y="103" class="node-sub">wide/squat red-blob shape check</text>
+          <text x="916" y="118" class="node-sub">visibility only, no position</text>
+          <text x="916" y="141" class="group-label">erc_perception</text>
+        </g>
+
+        <!-- perception -> orchestration edges -->
+        <path d="M 185 158 L 185 200 L 545 200 L 545 258" class="edge c-perception" marker-end="url(#arrow-perception)"/>
+        <rect x="270" y="188" width="230" height="15" class="edge-label-bg"/>
+        <text x="273" y="199" class="edge-label c-perception">shelf_column_identification</text>
+        <rect x="270" y="205" width="255" height="15" class="edge-label-bg"/>
+        <text x="273" y="216" class="edge-label c-perception">shelf_column_horizontal_error</text>
+
+        <path d="M 465 158 L 465 200 L 600 200 L 600 258" class="edge c-perception" marker-end="url(#arrow-perception)"/>
+        <rect x="608" y="222" width="205" height="15" class="edge-label-bg"/>
+        <text x="611" y="233" class="edge-label c-perception">shelf_row_identification</text>
+
+        <path d="M 745 158 L 745 200 L 900 200 L 900 258" class="edge c-perception" marker-end="url(#arrow-perception)"/>
+        <rect x="770" y="188" width="180" height="15" class="edge-label-bg"/>
+        <text x="773" y="199" class="edge-label c-perception">target_book_point</text>
+        <rect x="770" y="205" width="215" height="15" class="edge-label-bg"/>
+        <text x="773" y="216" class="edge-label c-perception">(direct to manipulation)</text>
+
+        <path d="M 1020 158 L 1020 200" class="edge-orphan c-perception"/>
+        <circle cx="1020" cy="204" r="3.5" class="c-perception"/>
+        <rect x="900" y="210" width="230" height="15" class="edge-label-bg"/>
+        <text x="903" y="221" class="edge-label c-perception">bin_identification &mdash; unconsumed</text>
+
+        <!-- ============ ORCHESTRATION band ============ -->
+        <g>
+          <rect x="60" y="290" width="370" height="170" rx="8" class="node-box c-navigation"/>
+          <text x="76" y="317" class="node-title">navigation_node</text>
+          <text x="76" y="336" class="node-sub">Holonomic mecanum drive. Owns two blocking</text>
+          <text x="76" y="351" class="node-sub">services; does NOT own the column search.</text>
+          <rect x="76" y="366" width="338" height="20" rx="4" class="fill-navigation"/>
+          <text x="84" y="380" class="edge-label c-navigation">srv /erc/approach_shelf</text>
+          <rect x="76" y="392" width="338" height="20" rx="4" class="fill-navigation"/>
+          <text x="84" y="406" class="edge-label c-navigation">srv /erc/navigate_to_bin</text>
+          <text x="76" y="432" class="node-sub">Wheel-stall detection + reverse-pulse</text>
+          <text x="76" y="446" class="node-sub">recovery on both drives.</text>
+        </g>
+
+        <g>
+          <rect x="470" y="258" width="260" height="234" rx="8" class="node-box c-integration"/>
+          <text x="486" y="286" class="node-title" style="font-size:14.5px">state_machine_node</text>
+          <text x="486" y="304" class="node-sub">The orchestrator. Also drives cmd_vel +</text>
+          <text x="486" y="318" class="node-sub">head tilt itself while spin-searching for</text>
+          <text x="486" y="332" class="node-sub">the column marker &mdash; before it ever calls</text>
+          <text x="486" y="346" class="node-sub">navigation_node.</text>
+          <line x1="486" y1="360" x2="714" y2="360" stroke="var(--line)"/>
+          <text x="486" y="378" class="edge-label c-integration">SEEK_COLUMN</text>
+          <text x="486" y="394" class="edge-label c-integration">&#8595; NAV_TO_COLUMN</text>
+          <text x="486" y="410" class="edge-label c-integration">&#8595; SEEK_BOOK</text>
+          <text x="486" y="426" class="edge-label c-integration">&#8595; GRASP</text>
+          <text x="486" y="442" class="edge-label c-integration">&#8595; NAV_TO_BIN &#8594; PLACE &#8594; DONE</text>
+          <text x="486" y="464" class="node-sub" fill="var(--danger)">any state &#8594; FAILED on timeout/error</text>
+        </g>
+
+        <g>
+          <rect x="770" y="290" width="370" height="170" rx="8" class="node-box c-manipulation"/>
+          <text x="786" y="317" class="node-title">manipulation_node</text>
+          <text x="786" y="336" class="node-sub">Right-arm pick/place via MoveGroup.</text>
+          <text x="786" y="351" class="node-sub">Strafes + lifts torso before planning.</text>
+          <rect x="786" y="366" width="338" height="20" rx="4" class="fill-manipulation"/>
+          <text x="794" y="380" class="edge-label c-manipulation">srv /erc/grasp_book(row)</text>
+          <rect x="786" y="392" width="338" height="20" rx="4" class="fill-manipulation"/>
+          <text x="794" y="406" class="edge-label c-manipulation">srv /erc/place_in_bin</text>
+          <text x="786" y="432" class="node-sub">Verifies grasp via /contacts, not just</text>
+          <text x="786" y="446" class="node-sub">"plan succeeded."</text>
+        </g>
+
+        <!-- state machine service calls -->
+        <path d="M 470 350 L 430 350" class="edge-service c-integration" marker-end="url(#arrow-integration)"/>
+        <path d="M 770 350 L 730 350" class="edge-service c-integration" marker-end="url(#arrow-integration)"/>
+        <rect x="431" y="322" width="40" height="15" class="edge-label-bg"/>
+        <text x="434" y="333" class="edge-label c-integration">calls</text>
+        <rect x="694" y="322" width="40" height="15" class="edge-label-bg"/>
+        <text x="697" y="333" class="edge-label c-integration">calls</text>
+
+        <!-- ============ MoveIt (external) ============ -->
+        <g>
+          <rect x="850" y="530" width="290" height="86" rx="8" class="node-box c-moveit"/>
+          <text x="866" y="558" class="node-title">move_group &nbsp;<tspan class="node-sub">(MoveIt, not ours)</tspan></text>
+          <text x="866" y="576" class="node-sub">OMPL planning for arm_right; the only</text>
+          <text x="866" y="590" class="node-sub">thing that actually drives that controller.</text>
+        </g>
+        <path d="M 940 460 L 940 530" class="edge c-manipulation" marker-end="url(#arrow-manipulation)"/>
+        <rect x="945" y="484" width="150" height="15" class="edge-label-bg"/>
+        <text x="948" y="495" class="edge-label c-manipulation">/move_action</text>
+        <rect x="945" y="500" width="150" height="15" class="edge-label-bg"/>
+        <text x="948" y="511" class="edge-label c-manipulation">/compute_ik</text>
+
+        <!-- ============ SUBSTRATE band ============ -->
+        <g>
+          <rect x="60"  y="700" width="530" height="150" rx="8" class="node-box c-substrate"/>
+          <text x="76" y="728" class="node-title">Gazebo (erc_world)</text>
+          <text x="76" y="746" class="node-sub">MecanumDrive plugin reads /cmd_vel directly.</text>
+          <text x="76" y="761" class="node-sub">Head camera (RGB+D), front/rear LiDAR, IMU,</text>
+          <text x="76" y="776" class="node-sub">and per-link /contacts all originate here.</text>
+        </g>
+        <g>
+          <rect x="620" y="700" width="520" height="150" rx="8" class="node-box c-substrate"/>
+          <text x="636" y="728" class="node-title">ros2_control</text>
+          <text x="636" y="746" class="node-sub">joint_trajectory_controllers: head, torso,</text>
+          <text x="636" y="761" class="node-sub">arm_left, arm_right, both grippers.</text>
+          <text x="636" y="776" class="node-sub">/joint_states is the shared feedback topic.</text>
+        </g>
+
+        <!-- navigation <-> substrate -->
+        <path d="M 200 460 L 200 700" class="edge c-navigation" marker-end="url(#arrow-navigation)"/>
+        <rect x="205" y="560" width="80" height="15" class="edge-label-bg"/>
+        <text x="208" y="571" class="edge-label c-navigation">/cmd_vel</text>
+        <path d="M 300 460 L 660 700" class="edge c-navigation" marker-end="url(#arrow-navigation)"/>
+        <rect x="430" y="590" width="215" height="15" class="edge-label-bg"/>
+        <text x="433" y="601" class="edge-label c-navigation">/head_controller/joint_trajectory</text>
+        <path d="M 130 700 Q 90 580 240 460" class="edge-feedback c-navigation" marker-end="url(#arrow-navigation)"/>
+        <rect x="90" y="590" width="20" height="15" class="edge-label-bg"/>
+        <text x="60" y="620" class="edge-label c-navigation" transform="rotate(-70 60 620)">odom &middot; scans &middot; joint_states</text>
+
+        <!-- state machine <-> substrate -->
+        <path d="M 560 492 L 560 700" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <rect x="565" y="660" width="150" height="15" class="edge-label-bg"/>
+        <text x="568" y="671" class="edge-label c-integration">/cmd_vel (spin search)</text>
+        <path d="M 640 492 L 750 700" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <rect x="720" y="640" width="170" height="15" class="edge-label-bg"/>
+        <text x="723" y="651" class="edge-label c-integration">/head_controller (tilt)</text>
+
+        <!-- manipulation <-> substrate -->
+        <path d="M 900 460 L 900 700" class="edge c-manipulation" marker-end="url(#arrow-manipulation)"/>
+        <rect x="905" y="560" width="225" height="15" class="edge-label-bg"/>
+        <text x="908" y="571" class="edge-label c-manipulation">gripper &middot; arm_left &middot; torso trajectories</text>
+        <path d="M 830 460 Q 700 580 590 700" class="edge c-manipulation" marker-end="url(#arrow-manipulation)"/>
+        <rect x="640" y="600" width="200" height="15" class="edge-label-bg"/>
+        <text x="643" y="611" class="edge-label c-manipulation">/cmd_vel (lateral align)</text>
+        <path d="M 1000 700 Q 980 580 1010 460" class="edge-feedback c-manipulation" marker-end="url(#arrow-manipulation)"/>
+        <rect x="1005" y="560" width="130" height="15" class="edge-label-bg"/>
+        <text x="1008" y="571" class="edge-label c-manipulation">/contacts</text>
+
+        <!-- moveit -> substrate -->
+        <path d="M 995 616 L 995 700" class="edge c-moveit" marker-end="url(#arrow-moveit)"/>
+        <rect x="1000" y="650" width="150" height="15" class="edge-label-bg"/>
+        <text x="1003" y="661" class="edge-label c-moveit">arm_right_controller</text>
+
+        <!-- ============ legend ============ -->
+        <g transform="translate(60, 862)">
+          <line x1="0" y1="0" x2="34" y2="0" class="edge c-integration"/>
+          <text x="42" y="4" class="legend-text">topic (pub &#8594; sub)</text>
+          <line x1="220" y1="0" x2="254" y2="0" class="edge-service c-integration"/>
+          <text x="262" y="4" class="legend-text">service call</text>
+          <line x1="420" y1="0" x2="454" y2="0" class="edge-feedback c-integration"/>
+          <text x="462" y="4" class="legend-text">sensor feedback</text>
+          <line x1="640" y1="0" x2="674" y2="0" class="edge-orphan c-integration"/>
+          <circle cx="674" cy="0" r="3.5" class="c-integration"/>
+          <text x="686" y="4" class="legend-text">published, unused</text>
+        </g>
+
+        <!-- ============ arrow markers ============ -->
+        <defs>
+          <marker id="arrow-perception" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="c-perception"/>
+          </marker>
+          <marker id="arrow-navigation" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="c-navigation"/>
+          </marker>
+          <marker id="arrow-manipulation" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="c-manipulation"/>
+          </marker>
+          <marker id="arrow-integration" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="c-integration"/>
+          </marker>
+          <marker id="arrow-substrate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="c-substrate"/>
+          </marker>
+          <marker id="arrow-moveit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="c-moveit"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        Perception feeds the orchestrator (column ID, column error, row ID) except for
+        <code class="topic">book_detector</code>, which hands its 3D grasp point straight to manipulation &mdash;
+        the state machine never sees it. <code class="topic">bin_detector</code>'s output has no subscriber at all.
+        The state machine also drives the base and head directly while spin-searching, before
+        <code class="topic">navigation_node</code> ever gets a service call.
+      </figcaption>
+    </div>
+  </section>
+
+  <section>
+    <h2>State machine sequence</h2>
+    <div class="diagram-shell">
+      <svg viewBox="0 0 1160 190" role="img" aria-label="state_machine_node moves through SEEK_COLUMN, NAV_TO_COLUMN, SEEK_BOOK, GRASP, NAV_TO_BIN, PLACE, then DONE in order; any state can instead transition to FAILED on a timeout or a failed service call.">
+        <g class="mono">
+          <!-- chain -->
+          <g transform="translate(20,30)">
+            <!-- 7 states -->
+            <g id="states"></g>
+          </g>
+        </g>
+        <!-- hand-placed states (equal width 150, gap 10) -->
+        <!-- x starts: 20,180,340,500,660,820,980 -->
+        <g font-family="IBM Plex Mono, monospace" font-size="12.5" font-weight="600">
+          <rect x="20"  y="30" width="150" height="46" rx="7" class="node-box c-integration"/>
+          <text x="95" y="58" text-anchor="middle" fill="var(--ink)">SEEK_COLUMN</text>
+          <rect x="180" y="30" width="150" height="46" rx="7" class="node-box c-navigation"/>
+          <text x="255" y="58" text-anchor="middle" fill="var(--ink)">NAV_TO_COLUMN</text>
+          <rect x="340" y="30" width="150" height="46" rx="7" class="node-box c-perception"/>
+          <text x="415" y="58" text-anchor="middle" fill="var(--ink)">SEEK_BOOK</text>
+          <rect x="500" y="30" width="150" height="46" rx="7" class="node-box c-manipulation"/>
+          <text x="575" y="58" text-anchor="middle" fill="var(--ink)">GRASP</text>
+          <rect x="660" y="30" width="150" height="46" rx="7" class="node-box c-navigation"/>
+          <text x="735" y="58" text-anchor="middle" fill="var(--ink)">NAV_TO_BIN</text>
+          <rect x="820" y="30" width="150" height="46" rx="7" class="node-box c-manipulation"/>
+          <text x="895" y="58" text-anchor="middle" fill="var(--ink)">PLACE</text>
+          <rect x="980" y="30" width="150" height="46" rx="7" class="node-box fill-substrate" stroke="var(--substrate)"/>
+          <text x="1055" y="58" text-anchor="middle" fill="var(--ink)">DONE</text>
+        </g>
+        <!-- chain arrows -->
+        <path d="M 170 53 L 178 53" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <path d="M 330 53 L 338 53" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <path d="M 490 53 L 498 53" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <path d="M 650 53 L 658 53" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <path d="M 810 53 L 818 53" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <path d="M 970 53 L 978 53" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <!-- failed branch -->
+        <rect x="490" y="128" width="180" height="38" rx="7" class="node-box" stroke="var(--danger)"/>
+        <text x="580" y="152" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12.5" font-weight="600" fill="var(--danger)">FAILED</text>
+        <path d="M 575 76 L 580 128" class="edge" stroke="var(--danger)" stroke-dasharray="5 4" marker-end="url(#arrow-danger)"/>
+        <text x="588" y="105" class="edge-label" fill="var(--danger)">timeout / service error</text>
+        <defs>
+          <marker id="arrow-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--danger)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        Every state can fail out to <code class="topic">FAILED</code> on its own timeout or a service
+        returning <code class="topic">success:false</code> &mdash; there's no cross-state retry, by design
+        (the rubric scores error handling, not silent masking).
+      </figcaption>
+    </div>
+  </section>
+
+  <section>
+    <h2>ROS 2 &harr; Gazebo: the middleware underneath</h2>
+    <div class="diagram-shell">
+      <svg viewBox="0 0 1200 420" role="img" aria-label="The team's ROS 2 nodes communicate over rclpy/rclcpp, RMW, and CycloneDDS on ROS_DOMAIN_ID 23. Gazebo runs as a separate process with its own gz-transport graph. Three ros_gz_bridge parameter_bridge instances translate specific topics between the two: the main bridge for clock, cmd_vel, odom, scans, and IMU; a dedicated head_camera_bridge for the RGB-D feed; and a contact_bridge for per-link collision topics, the last two one-way, Gazebo to ROS. The one exception is gz_ros2_control, a System Plugin loaded into the Gazebo process itself, which exposes controller_manager and the joint_trajectory_controllers as real ROS 2 nodes with no bridge involved.">
+
+        <rect x="30" y="50" width="430" height="300" rx="10" class="node-box fill-integration" stroke="var(--integration)"/>
+        <text x="50" y="76" class="band-label c-integration">ROS 2 GRAPH</text>
+
+        <rect x="740" y="50" width="430" height="300" rx="10" class="node-box fill-substrate" stroke="var(--substrate)"/>
+        <text x="760" y="76" class="band-label c-substrate">GAZEBO (erc_world)</text>
+
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+          <rect x="50" y="90" width="390" height="28" rx="5" class="node-box c-integration"/>
+          <text x="65" y="108" fill="var(--ink)">state_machine_node</text>
+          <rect x="50" y="126" width="390" height="28" rx="5" class="node-box c-navigation"/>
+          <text x="65" y="144" fill="var(--ink)">navigation_node</text>
+          <rect x="50" y="162" width="390" height="28" rx="5" class="node-box c-manipulation"/>
+          <text x="65" y="180" fill="var(--ink)">manipulation_node</text>
+          <rect x="50" y="198" width="390" height="28" rx="5" class="node-box c-perception"/>
+          <text x="65" y="216" fill="var(--ink)">perception &times; 4 (shelf/book/bin)</text>
+          <rect x="50" y="234" width="390" height="28" rx="5" class="node-box c-moveit"/>
+          <text x="65" y="252" fill="var(--ink)">move_group (MoveIt)</text>
+          <rect x="50" y="270" width="390" height="28" rx="5" class="node-box" stroke="var(--line-strong)"/>
+          <text x="65" y="288" fill="var(--ink)">robot_state_publisher</text>
+        </g>
+        <text x="50" y="322" class="node-sub">rclpy / rclcpp &#8594; RMW &#8594; CycloneDDS</text>
+        <text x="50" y="337" class="node-sub">ROS_DOMAIN_ID=23, one shared domain for every node above</text>
+
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+          <rect x="760" y="90" width="390" height="28" rx="5" class="node-box c-substrate"/>
+          <text x="775" y="108" fill="var(--ink)">gz sim server &mdash; physics</text>
+          <rect x="760" y="126" width="390" height="28" rx="5" class="node-box c-substrate"/>
+          <text x="775" y="144" fill="var(--ink)">sensors: camera+depth &middot; LiDAR &middot; IMU</text>
+          <rect x="760" y="162" width="390" height="28" rx="5" class="node-box c-substrate"/>
+          <text x="775" y="180" fill="var(--ink)">MecanumDrive plugin</text>
+          <rect x="760" y="198" width="390" height="28" rx="5" class="node-box c-substrate"/>
+          <text x="775" y="216" fill="var(--ink)">shelf &middot; books &middot; bin (static models)</text>
+          <rect x="760" y="234" width="390" height="28" rx="5" class="node-box c-integration"/>
+          <text x="775" y="252" fill="var(--ink)">gz_ros2_control (System Plugin)</text>
+        </g>
+        <text x="760" y="322" class="node-sub">gz-transport &mdash; its own pub/sub graph,</text>
+        <text x="760" y="337" class="node-sub">not ROS 2, running in a separate process</text>
+
+        <!-- bridge lane -->
+        <rect x="490" y="88" width="220" height="52" rx="6" class="node-box fill-integration" stroke="var(--line-strong)"/>
+        <text x="502" y="106" class="edge-label" fill="var(--ink)">parameter_bridge (main)</text>
+        <text x="502" y="122" class="node-sub">clock &middot; cmd_vel &middot; odom &middot; scans &middot; imu</text>
+        <rect x="490" y="156" width="220" height="46" rx="6" class="node-box fill-integration" stroke="var(--line-strong)"/>
+        <text x="502" y="174" class="edge-label" fill="var(--ink)">head_camera_bridge</text>
+        <text x="502" y="190" class="node-sub">color + depth image, camera_info</text>
+        <rect x="490" y="218" width="220" height="46" rx="6" class="node-box fill-integration" stroke="var(--line-strong)"/>
+        <text x="502" y="236" class="edge-label" fill="var(--ink)">contact_bridge</text>
+        <text x="502" y="252" class="node-sub">per-link /contacts</text>
+
+        <path d="M 440 114 L 488 114" class="edge c-integration" marker-start="url(#arrow-integration)" marker-end="url(#arrow-integration)"/>
+        <path d="M 712 114 L 758 114" class="edge c-integration" marker-start="url(#arrow-integration)" marker-end="url(#arrow-integration)"/>
+        <path d="M 440 179 L 488 179" class="edge c-substrate" marker-end="url(#arrow-integration)"/>
+        <path d="M 712 179 L 758 179" class="edge c-substrate" marker-end="url(#arrow-substrate)"/>
+        <path d="M 440 241 L 488 241" class="edge c-substrate" marker-end="url(#arrow-integration)"/>
+        <path d="M 712 241 L 758 241" class="edge c-substrate" marker-end="url(#arrow-substrate)"/>
+        <text x="600" y="80" text-anchor="middle" class="group-label">GZ_TO_ROS &#8595;/&#8593; both ways</text>
+
+        <!-- direct, unbridged path -->
+        <path d="M 758 248 Q 600 380 440 300" class="edge c-integration" marker-end="url(#arrow-integration)"/>
+        <rect x="500" y="358" width="260" height="15" class="edge-label-bg"/>
+        <text x="503" y="369" class="edge-label c-integration">controller_manager, /joint_states</text>
+        <rect x="500" y="374" width="260" height="15" class="edge-label-bg"/>
+        <text x="503" y="385" class="edge-label c-integration">same process &mdash; no bridge involved</text>
+      </svg>
+      <figcaption>
+        Everything else crosses through a named <code class="topic">ros_gz_bridge</code> instance
+        translating <code class="topic">gz.msgs</code> &harr; ROS 2 messages. <code class="topic">gz_ros2_control</code>
+        doesn't: it's a System Plugin loaded straight into the Gazebo process, so
+        <code class="topic">controller_manager</code> and its <code class="topic">joint_trajectory_controller</code>s
+        are ordinary ROS 2 nodes that happen to live inside <code class="topic">gz sim</code>, not translated topics.
+      </figcaption>
+    </div>
+  </section>
+
+  <section>
+    <h2>Roles</h2>
+    <div class="roles">
+
+      <div class="role-card perception">
+        <div>
+          <div class="role-name">Perception</div>
+          <div class="role-pkg">erc_perception + book_detector (erc_solution)</div>
+        </div>
+        <p>
+          Four independent, single-purpose nodes, each subscribed to the same head
+          camera feed, each publishing one fact and nothing else. None of them plan
+          or drive &mdash; they only report what the camera currently sees.
+        </p>
+        <ul>
+          <li><span class="kind">pub</span><span class="topic">/erc/shelf_column_identification</span></li>
+          <li><span class="kind">pub</span><span class="topic">/erc/shelf_column_horizontal_error</span></li>
+          <li><span class="kind">pub</span><span class="topic">/erc/shelf_row_identification</span></li>
+          <li><span class="kind">pub</span><span class="topic">/erc/target_book_point</span></li>
+          <li><span class="kind">pub</span><span class="topic">/erc/bin_identification</span></li>
+        </ul>
+        <div class="role-note">
+          <code class="topic">book_detector</code> is the odd one out: it also reads the
+          depth image, and its 3D point goes straight to manipulation rather than
+          through the state machine, because it exists to correct for exactly how
+          far off-target navigation actually parked.
+        </div>
+      </div>
+
+      <div class="role-card navigation">
+        <div>
+          <div class="role-name">Navigation</div>
+          <div class="role-pkg">erc_solution &middot; navigation_node</div>
+        </div>
+        <p>
+          One node, two blocking services, both driving the same holonomic mecanum
+          base. It does not search for the column marker itself &mdash; that loop lives
+          in the state machine, which only calls <code class="topic">approach_shelf</code>
+          once it has already centred visually.
+        </p>
+        <ul>
+          <li><span class="kind">srv</span><span class="topic">approach_shelf</span> &mdash; square up, drive to LiDAR standoff</li>
+          <li><span class="kind">srv</span><span class="topic">navigate_to_bin</span> &mdash; waypoint drive to the start zone</li>
+          <li><span class="kind">sub</span><span class="topic">/odom, /scan_front_raw, /scan_rear_raw</span></li>
+          <li><span class="kind">sub</span><span class="topic">/joint_states</span> &mdash; wheel-stall detection</li>
+        </ul>
+        <div class="role-note">
+          Both drives share one stall-recovery routine: if commanded wheels read
+          near-zero velocity for too long, reverse briefly and resume rather than
+          push against whatever it's stuck on.
+        </div>
+      </div>
+
+      <div class="role-card manipulation">
+        <div>
+          <div class="role-name">Manipulation</div>
+          <div class="role-pkg">erc_solution &middot; manipulation_node</div>
+        </div>
+        <p>
+          Right-arm pick-and-place, planned through MoveIt's low-level
+          <code class="topic">MoveGroup</code> action rather than <code class="topic">moveit_py</code>.
+          It corrects two things navigation can't: how far off-centre the base
+          parked, and how high the target row sits.
+        </p>
+        <ul>
+          <li><span class="kind">srv</span><span class="topic">grasp_book(row)</span> &mdash; hover, approach, close, verify, retreat</li>
+          <li><span class="kind">srv</span><span class="topic">place_in_bin</span> &mdash; fixed pose, since navigation already parked at a known standoff</li>
+          <li><span class="kind">pub</span><span class="topic">/cmd_vel</span> &mdash; lateral strafe before planning</li>
+          <li><span class="kind">pub</span><span class="topic">/torso_controller</span> &mdash; lift for rows above baseline reach</li>
+        </ul>
+        <div class="role-note">
+          A successful MoveGroup plan only means the pose was reached. The real
+          grasp check is <code class="topic">/contacts</code> showing a
+          <code class="topic">gripper_right_*</code> / <code class="topic">book_*</code>
+          collision, re-checked after retreat, not just at the moment the gripper closes.
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Two things that surprise people reading this graph cold</h2>
+    <div class="notes">
+      <div class="note">
+        <div class="note-head">Perception can skip the orchestrator</div>
+        <div>
+          <code class="topic">target_book_point</code> goes directly from
+          <code class="topic">book_detector</code> to <code class="topic">manipulation_node</code>.
+          <code class="topic">state_machine_node</code> never routes it &mdash; it just waits for
+          <code class="topic">grasp_book()</code> to return.
+        </div>
+      </div>
+      <div class="note">
+        <div class="note-head">The orchestrator drives the robot too</div>
+        <div>
+          During <code class="topic">SEEK_COLUMN</code>, <code class="topic">state_machine_node</code>
+          publishes <code class="topic">/cmd_vel</code> and head-tilt commands itself &mdash; it only
+          hands control to <code class="topic">navigation_node</code> once perception has already
+          confirmed centring.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Source: <code>src/erc_solution</code> + <code>src/erc_perception</code>, branch <code>integration-test</code>.
+  </footer>
+
+</div>

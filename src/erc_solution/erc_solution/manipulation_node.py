@@ -438,9 +438,13 @@ class ManipulationNode(Node):
         sign = math.copysign(1.0, dy)
         cmd = Twist()
         cmd.linear.y = sign * CENTERING_LINEAR_SPEED
-        deadline = time.monotonic() + CENTERING_TIMEOUT_SEC
+        # Sim-time deadline: base motion covers distance at sim speed, so a
+        # wall-clock cap cuts the move short whenever the real-time factor
+        # drops (seen at ~7%). Wall-clock cap kept only as a hang backstop.
+        deadline = self.get_clock().now().nanoseconds * 1e-9 + CENTERING_TIMEOUT_SEC
+        wall_cap = time.monotonic() + 600.0
         c, s = math.cos(-start_yaw), math.sin(-start_yaw)
-        while time.monotonic() < deadline:
+        while self.get_clock().now().nanoseconds * 1e-9 < deadline and time.monotonic() < wall_cap:
             x, y, _ = self.odom_pose
             ddx, ddy = x - start_x, y - start_y
             # rotate the odom-frame delta back into the base's strafe axis
@@ -766,15 +770,22 @@ class ManipulationNode(Node):
             if close is not None:
                 shift = math.dist(close, face)
                 if shift > BOOK_REAIM_MAX_SHIFT:
-                    response.success = False
-                    response.message = f'book seen {shift:.3f}m from its earlier position; not reaching'
-                    return response
-                face = close
-                pregrasp, grasp = self._grasp_poses(face)
-                if not self.move_linear(pregrasp):
-                    response.success = False
-                    response.message = 'failed to re-align at the pre-grasp pose'
-                    return response
+                    # At the hover pose the gripper sits between the head camera
+                    # and the book, so this detection can be clipped or read depth
+                    # off the gripper (seen: 0.241m jump with the book unmoved).
+                    # Treat it like "not visible" and keep the clear-view fix from
+                    # before the hover, which matched ground truth to 1-3cm.
+                    self.get_logger().warn(
+                        f'close-range detection {shift:.3f}m off (dx={close[0] - face[0]:+.3f} '
+                        f'dy={close[1] - face[1]:+.3f} dz={close[2] - face[2]:+.3f}); '
+                        'likely occluded by the gripper -- using the earlier fix')
+                else:
+                    face = close
+                    pregrasp, grasp = self._grasp_poses(face)
+                    if not self.move_linear(pregrasp):
+                        response.success = False
+                        response.message = 'failed to re-align at the pre-grasp pose'
+                        return response
             else:
                 self.get_logger().warn('book not visible from the hover pose; using the earlier fix')
 
@@ -784,6 +795,16 @@ class ManipulationNode(Node):
                 response.message = 'failed to move in to the grasp pose'
                 return response
             after = self._fresh_book_face()
+            # With the fingers around the book the gripper hides it from the
+            # head camera, so this detection can land on the same-coloured
+            # book in the next column instead (seen: dy=+0.716 with the
+            # target still straddled). A shift past BOOK_REAIM_MAX_SHIFT is a
+            # different book, not a push -- close on the one we reached.
+            if after is not None and math.dist(after[:2], face[:2]) > BOOK_REAIM_MAX_SHIFT:
+                self.get_logger().warn(
+                    f'post-reach detection {math.dist(after[:2], face[:2]):.3f}m away is a '
+                    'different book (target hidden by the gripper); closing on the reached pose')
+                after = None
             if after is not None and (abs(after[0] - face[0]) > BOOK_PUSH_TOLERANCE
                                       or abs(after[1] - face[1]) > BOOK_PUSH_TOLERANCE):
                 self.move_linear(pregrasp)
@@ -935,9 +956,14 @@ class ManipulationNode(Node):
         sx, sy, syaw = self.odom_pose
         cmd = Twist()
         cmd.linear.x = math.copysign(BIN_APPROACH_SPEED, distance)
-        deadline = time.monotonic() + CENTERING_TIMEOUT_SEC + abs(distance) / BIN_APPROACH_SPEED * 3
+        # Sim-time deadline (see _strafe_base): at ~7% RTF a wall-clock cap of
+        # 8 + distance/speed*3 seconds let the base cover only 0.151m of a
+        # 0.485m approach, leaving the bin out of reach.
+        deadline = (self.get_clock().now().nanoseconds * 1e-9
+                    + CENTERING_TIMEOUT_SEC + abs(distance) / BIN_APPROACH_SPEED * 3)
+        wall_cap = time.monotonic() + 600.0
         moved = 0.0
-        while time.monotonic() < deadline:
+        while self.get_clock().now().nanoseconds * 1e-9 < deadline and time.monotonic() < wall_cap:
             x, y, _ = self.odom_pose
             moved = (x - sx) * math.cos(syaw) + (y - sy) * math.sin(syaw)
             if abs(moved) >= abs(distance) - 0.01:
