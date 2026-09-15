@@ -107,7 +107,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
 
-from geometry_msgs.msg import PointStamped, PoseStamped, Vector3
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist, Vector3
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from shape_msgs.msg import SolidPrimitive
 from ros_gz_interfaces.msg import Contacts
@@ -173,11 +173,31 @@ MOVEIT_SUCCESS = 1  # moveit_msgs/msg/MoveItErrorCodes.SUCCESS
 # accomplish "out of the way" at that shallow an angle. Reverted to the
 # ~80-92deg yaw values below, which have an actual track record of
 # keeping the arm clear in live runs.
+#
+# Follow-up (live-run investigation): even with the head_2_link/gripper
+# self-collision above resolved, book/column detection kept losing lock or
+# reading corrupted positions across many live runs -- confirmed via a
+# camera-frame grab (not just /check_state_validity, which only checks
+# self-collision, not what the camera can actually see) that the
+# arm_right_2_joint=0.5 pose sits DIRECTLY in the head camera's forward
+# view once the head tilts down for book search (BOOK_APPROACH_HEAD_TILT
+# and the ROW_SEARCH_HEAD_TILTS band): the gripper filled most of the
+# frame, leaving perception blind to most of the shelf regardless of
+# self-collision status. Yaw alone (tried -1.4, -1.7, -2.4 rad) barely
+# changed how much of the frame it blocked -- at this close range to the
+# camera, small angular sweeps around the shoulder yaw axis don't move the
+# gripper much in the image; changing the arm's DEPTH/HEIGHT relative to
+# the camera did. Dropping arm_right_2_joint (shoulder lift) to -0.5 (down
+# and back, instead of up toward the head) confirmed via live screenshot to
+# clear the view almost entirely (only a small fingertip sliver remains,
+# off the shelf) -- re-verified valid=True via /check_state_validity across
+# every head tilt this codebase uses, arm_left simultaneously at its own
+# rest pose.
 TUCK_JOINTS = {
     'arm_right_1_joint': -0.8,
-    'arm_right_2_joint': 0.5,
+    'arm_right_2_joint': -0.5,
     'arm_right_3_joint': 0.0,
-    'arm_right_4_joint': -2.0,
+    'arm_right_4_joint': -1.8,
     'arm_right_5_joint': 0.0,
     'arm_right_6_joint': 0.0,
     'arm_right_7_joint': 0.0,
@@ -279,6 +299,32 @@ ARM_LEFT_DOWN_JOINTS = {
 TORSO_REACH_BASELINE_Z = 1.0
 TORSO_LIFT_MAX = 0.35
 TORSO_LIFT_VELOCITY = 0.035  # m/s, URDF velocity limit -- used to size the wait
+
+# Lateral pre-grasp alignment. navigation_node's approach_shelf never strafes
+# (see INTERFACES.md's "1.83m lateral miss" note and book_point_detector's own
+# module docstring) -- it only rotates to center the column marker, then
+# drives straight in, so the base can stop laterally off-center from the
+# actual book by an amount the arm's own reach can't absorb. Confirmed live
+# via /compute_ik sweeps against a real failed grasp (top shelf row, book at
+# y=0.38m off centerline): the arm_right + full torso lift combination
+# reached y=0.0 out to x=0.7m forward, but couldn't reach y=0.38m at ANY
+# forward distance, including much closer ones. Height wasn't the limiting
+# factor -- (x=0.6, y=0.0, z=1.58) planned fine -- lateral offset was. Since
+# the base is a holonomic mecanum drive (can strafe directly, not just
+# rotate+drive), close that gap here, right before planning, instead of
+# reaching for a pose the arm genuinely cannot attain. This does mean
+# manipulation_node commands /cmd_vel directly, normally navigation_node's
+# job per INTERFACES.md -- justified because this correction is specifically
+# about making the arm's own target reachable, not general navigation.
+LATERAL_ALIGN_TOLERANCE = 0.12  # m -- how close to the book's y=0 (base-centered) counts as aligned
+LATERAL_KP = 1.0
+MAX_LATERAL_SPEED = 0.15        # m/s -- slow, precise strafe, not a navigation-speed drive
+LATERAL_ALIGN_TIMEOUT = 8.0     # s
+LATERAL_CONTROL_PERIOD = 0.1    # s
+# Real physical motion per cycle at MAX_LATERAL_SPEED is ~0.015m -- a jump
+# far beyond that within one cycle means a different book (see the
+# rejection comment in _align_laterally_to_book), not real tracked motion.
+MAX_PLAUSIBLE_Y_JUMP = 0.15     # m per LATERAL_CONTROL_PERIOD
 
 
 class ManipulationNode(Node):
@@ -408,6 +454,10 @@ class ManipulationNode(Node):
         self.gripper_pub = self.create_publisher(
             JointTrajectory, '/gripper_right_controller/joint_trajectory', 10)
 
+        # --- Lateral pre-grasp alignment: direct /cmd_vel strafe -- see
+        # LATERAL_ALIGN_TOLERANCE above for why this lives here ---
+        self.strafe_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
         # --- arm_left: direct topic publish too -- see ARM_LEFT_DOWN_JOINTS ---
         self.arm_left_pub = self.create_publisher(
             JointTrajectory, '/arm_left_controller/joint_trajectory', 10)
@@ -509,6 +559,88 @@ class ManipulationNode(Node):
         tuned assuming torso=0, so a raise left over from grasp_book would
         throw it off by however much lift was applied."""
         self._command_torso(0.0)
+
+    def _recover_to_tuck(self):
+        """Best-effort cleanup on a failed grasp_book: a pregrasp hover that
+        DID succeed but was then followed by a failed grasp-pose plan left
+        the arm sitting at whatever the IK/OMPL solver picked for that
+        hover -- confirmed live via /joint_states this can be a valid but
+        wildly contorted configuration (e.g. arm_right_1_joint solved to
+        -3.56 rad, visually reads as the arm having spun most of the way
+        around), not just an awkward-looking rest. Also resets the torso,
+        which raise_torso_for_height may have left lifted. Never leave the
+        robot sitting in that state indefinitely -- return to the known-
+        clear tuck pose so a failed attempt doesn't look (or behave) like
+        the robot is stuck/broken."""
+        self.set_gripper(self.gripper_open)
+        self.reset_torso()
+        if not self.move_to_tuck():
+            self.get_logger().warn('recovery tuck after failed grasp did not complete')
+
+    def _align_laterally_to_book(self):
+        """Blocking: strafe sideways on the holonomic base until the book's
+        y (in planning_frame, i.e. how far off the robot's centerline it
+        is) is within LATERAL_ALIGN_TOLERANCE, or LATERAL_ALIGN_TIMEOUT
+        elapses. Best-effort -- see LATERAL_ALIGN_TOLERANCE above for why
+        this exists. No-ops immediately if already aligned or if the point
+        stream/TF isn't available."""
+        start = time.monotonic()
+        deadline = start + LATERAL_ALIGN_TIMEOUT
+        first_y = None
+        last_y = None
+        iterations = 0
+        rejected = 0
+        last_log = start
+        while time.monotonic() < deadline:
+            point = self.latest_book_point
+            if point is None:
+                self.get_logger().warn('lateral align: latest_book_point went None mid-loop -- stopping')
+                break
+            transformed = self.transform_to_planning_frame(point)
+            if transformed is None:
+                self.get_logger().warn('lateral align: TF transform failed mid-loop -- stopping')
+                break
+            y = transformed.point.y
+
+            # Outlier rejection: a genuinely tracked book's y can only drift
+            # by a tiny amount per control cycle (at MAX_LATERAL_SPEED, real
+            # physical motion is ~0.015m per LATERAL_CONTROL_PERIOD). Seen
+            # live: as the base strafes past roughly a column's width, an
+            # ADJACENT column's same-coloured book can enter frame and
+            # book_point_detector's largest-blob-of-target-colour logic can
+            # jump to tracking THAT book instead -- observed as a ~0.7m
+            # single-cycle jump in y that then dragged the base the wrong
+            # way and never converged. A jump this large in one cycle is
+            # physically impossible for the same tracked book, so treat it
+            # as a bad sample and hold the previous command rather than
+            # reacting to what's very likely a different book entirely.
+            if last_y is not None and abs(y - last_y) > MAX_PLAUSIBLE_Y_JUMP:
+                rejected += 1
+                time.sleep(LATERAL_CONTROL_PERIOD)
+                continue
+
+            if first_y is None:
+                first_y = y
+            last_y = y
+            iterations += 1
+            now = time.monotonic()
+            if now - last_log >= 1.0:
+                last_log = now
+                self.get_logger().info(
+                    f'lateral align: t={now - start:.1f}s y={y:.3f} iterations={iterations} rejected={rejected}')
+            if abs(y) <= LATERAL_ALIGN_TOLERANCE:
+                break
+            cmd = Twist()
+            cmd.linear.y = max(-MAX_LATERAL_SPEED, min(MAX_LATERAL_SPEED, LATERAL_KP * y))
+            self.strafe_pub.publish(cmd)
+            time.sleep(LATERAL_CONTROL_PERIOD)
+        self.strafe_pub.publish(Twist())
+        time.sleep(0.3)  # let residual motion settle before replanning
+        self.get_logger().info(
+            f'lateral align: first_y={first_y} last_y={last_y} iterations={iterations} '
+            f'elapsed={time.monotonic() - start:.1f}s '
+            f'{"within" if last_y is not None and abs(last_y) <= LATERAL_ALIGN_TOLERANCE else "OUTSIDE"} '
+            f'tolerance={LATERAL_ALIGN_TOLERANCE}')
 
     # ------------------------------------------------------------------
     def _on_book_point(self, msg: PointStamped):
@@ -785,9 +917,33 @@ class ManipulationNode(Node):
             response.message = f'TF transform of target_book_point to {self.planning_frame} failed'
             return response
 
+        self._align_laterally_to_book()
+
+        # Strafing moved the base, so the point above is stale (it was
+        # relative to the pre-strafe base_footprint) -- wait for a fresh
+        # detection against the post-strafe pose rather than reusing it.
+        self.latest_book_point = None
+        book_point = self._wait_for_point('latest_book_point')
+        if book_point is None:
+            response.success = False
+            response.message = (
+                'lost /erc/target_book_point after lateral alignment strafe')
+            return response
+        book_point = self.transform_to_planning_frame(book_point)
+        if book_point is None:
+            response.success = False
+            response.message = (
+                f'TF transform of target_book_point to {self.planning_frame} '
+                'failed (post-align)')
+            return response
+
         book_pose = self.point_to_pose(book_point)
         dx, dy, dz = self.approach_offset
         pregrasp = self.offset_pose(book_pose, dx, dy, dz)
+        bp = book_pose.pose.position
+        self.get_logger().info(
+            f'grasp target (post-align, {self.planning_frame}): '
+            f'x={bp.x:.3f} y={bp.y:.3f} z={bp.z:.3f}')
 
         # Target coordinates are in the ground-referenced planning frame, so
         # they don't change as the torso rises -- this only buys the arm
@@ -797,6 +953,7 @@ class ManipulationNode(Node):
         if not self.move_to_pose_via_ik(pregrasp):
             response.success = False
             response.message = 'failed to plan/move to pre-grasp hover pose'
+            self._recover_to_tuck()
             return response
 
         self.set_gripper(self.gripper_open)
@@ -806,6 +963,7 @@ class ManipulationNode(Node):
         if not self.move_to_pose_via_ik(book_pose, position_tolerance=self.grasp_pos_tol):
             response.success = False
             response.message = 'failed to plan/move to grasp pose'
+            self._recover_to_tuck()
             return response
 
         self.set_gripper(self.gripper_closed)
