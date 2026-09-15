@@ -102,16 +102,15 @@ class BookDetector(Node):
 
     # ------------------------------------------------------------------
     def _find_target_blob(self, color_frame):
-        """Picks the target-colour blob closest to the image's horizontal
-        centre, not the largest. The shelf can have several books of the
+        """Picks the target-colour blob closest to the image centre, not the
+        largest. The shelf can have several books of the
         same colour visible at once (one per column, colours are only
         unique *within* a column -- see simulation.launch.py's book spawn
         logic), and the largest-blob heuristic used to flip between two of
         them from one frame to the next depending on which was fractionally
         bigger. That fed manipulation_node's base-centering loop a moving
-        target it could never converge on. Whatever book the robot is
-        actually squared up to (the one nearest dead ahead) is the one we
-        actually approached/tucked the arm for, so that's the stable choice."""
+        target it could never converge on. manipulation_node aims the head at
+        the book it's reaching for, so the one nearest centre is that book."""
         hsv = cv2.cvtColor(color_frame, cv2.COLOR_BGR2HSV)
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for lower, upper in COLOUR_RANGES[self.target_colour]:
@@ -119,6 +118,7 @@ class BookDetector(Node):
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         image_center_u = color_frame.shape[1] / 2.0
+        image_center_v = color_frame.shape[0] / 2.0
         best = None
         best_center_dist = None
         for contour in contours:
@@ -126,7 +126,9 @@ class BookDetector(Node):
             if area < MIN_BLOB_AREA:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
-            center_dist = abs((x + w / 2.0) - image_center_u)
+            # 2D: with the head aimed at the target (manipulation_node._look_at)
+            # this also rejects same-colour books on the rows above/below.
+            center_dist = math.hypot((x + w / 2.0) - image_center_u, (y + h / 2.0) - image_center_v)
             if best is None or center_dist < best_center_dist:
                 best = (x, y, w, h)
                 best_center_dist = center_dist
