@@ -25,11 +25,12 @@ class StateMachineNode(Node):
         ])
         self.declare_parameter('shelf_column_number', 0)
         self.declare_parameter('book_colour', '')
-        # lets us test the rest of the pipeline before manipulation_node is
-        # done - GRASP/PLACE get skipped with a warning instead of failing
-        # the run if the service isn't up. flip to false once manipulation
-        # actually works so a real failure stops the run properly.
-        self.declare_parameter('skip_manipulation_if_unavailable', True)
+        # manipulation_node (aleksandria/arm_manipulation_node) is now wired
+        # in via solution.launch.py, so a missing grasp/place service means
+        # something actually broke rather than "not implemented yet" --
+        # fail the run instead of silently skipping. Override back to true
+        # for pipeline-only testing without the arm/MoveIt stack running.
+        self.declare_parameter('skip_manipulation_if_unavailable', False)
 
         self.target_column = self.get_parameter('shelf_column_number').value
         self.target_colour = self.get_parameter('book_colour').value

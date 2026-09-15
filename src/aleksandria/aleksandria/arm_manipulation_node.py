@@ -45,6 +45,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
 
 from geometry_msgs.msg import PoseStamped, Vector3
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -58,6 +59,8 @@ from moveit_msgs.msg import (
     PositionConstraint,
     OrientationConstraint,
 )
+
+from erc_interfaces.srv import GraspBook, PlaceInBin
 
 import tf2_ros
 from tf2_geometry_msgs import do_transform_pose_stamped
@@ -111,20 +114,40 @@ class ArmManipulationNode(Node):
         self.move_group_client = ActionClient(self, MoveGroup, '/move_action')
 
         # --- Gripper: direct topic publish, matching the controller interface ---
+        # NOTE: the spawned controller is gripper_right_controller_raw (see
+        # erc_bringup/config/controller_params.yaml) -- publishing to the
+        # non-_raw topic silently goes nowhere and the gripper never moves.
         self.gripper_pub = self.create_publisher(
-            JointTrajectory, '/gripper_right_controller/joint_trajectory', 10)
+            JointTrajectory, '/gripper_right_controller_raw/joint_trajectory', 10)
 
         # --- TF for transforming perception output into base_frame ---
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # --- Perception input ---
-        self.task_started = False
-        self.pending_pose = None
+        # Latest transformed book pose available to a grasp_book call. Kept
+        # up to date continuously (not latched to the first message) so
+        # repeated calls across different rows/books pick up fresh poses.
+        self.latest_book_pose = None
         self.create_subscription(
             PoseStamped, '/erc/target_book_pose', self.book_pose_callback, 10)
 
-        self.get_logger().info('Arm manipulation node ready — waiting for target book pose...')
+        # --- Service interface used by state_machine_node ---
+        # Calls block on MoveGroup goals (spin_until_future_complete), so
+        # these must run on their own callback group under a
+        # MultiThreadedExecutor -- see main() below.
+        cb_group = ReentrantCallbackGroup()
+        self.create_service(
+            GraspBook, '/erc/grasp_book', self._on_grasp_book, callback_group=cb_group)
+        self.create_service(
+            PlaceInBin, '/erc/place_in_bin', self._on_place_in_bin, callback_group=cb_group)
+
+        # Retained across the grasp_book -> place_in_bin call pair so the
+        # arm knows where to retreat from before heading to the bin.
+        self._pregrasp_pose = None
+
+        self.get_logger().info(
+            'Arm manipulation node ready — /erc/grasp_book and /erc/place_in_bin online')
 
     # ------------------------------------------------------------------
     def make_pose(self, x, y, z, frame_id, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
@@ -240,68 +263,85 @@ class ArmManipulationNode(Node):
 
     # ------------------------------------------------------------------
     def book_pose_callback(self, msg: PoseStamped):
-        """Only stores the pose -- does NOT run planning here. Planning
-        involves blocking spin_until_future_complete() calls, which must
-        not be nested inside a callback that's already running under an
-        outer spin(). See main()."""
-        if self.task_started:
-            return
+        """Keeps the latest transformed book pose available for the next
+        grasp_book service call. Runs on the node's default callback
+        group; transform_to_base() is non-blocking (a single TF lookup),
+        so this is safe to do inline."""
         book_pose = self.transform_to_base(msg)
         if book_pose is None:
             return
-        self.task_started = True
-        self.pending_pose = book_pose
-        self.get_logger().info('Target book pose received and transformed — ready to run')
+        self.latest_book_pose = book_pose
 
-    def run_pick_and_place(self, book_pose: PoseStamped):
+    # ------------------------------------------------------------------
+    # Service handlers. These run under a ReentrantCallbackGroup /
+    # MultiThreadedExecutor (see main()) so their blocking move_to_pose()
+    # calls don't deadlock the executor the way they would under a single
+    # spin() thread.
+    def _on_grasp_book(self, request, response):
+        if self.latest_book_pose is None:
+            response.success = False
+            response.message = 'no target book pose available on /erc/target_book_pose'
+            return response
+
+        book_pose = self.latest_book_pose
         dx, dy, dz = self.approach_offset
         pregrasp = self.offset_pose(book_pose, dx, dy, dz)
 
         # 1. Hover in front of the book
         if not self.move_to_pose(pregrasp):
-            return
+            response.success = False
+            response.message = f'failed to plan/execute pregrasp move for row {request.row}'
+            return response
 
         # 2. Open gripper before moving in
         self.set_gripper(self.gripper_open)
 
         # 3. Move in to the book
         if not self.move_to_pose(book_pose):
-            return
+            response.success = False
+            response.message = f'failed to plan/execute grasp move for row {request.row}'
+            return response
 
         # 4. Close gripper on the book
         self.set_gripper(self.gripper_closed)
 
-        # 5. Retreat with the book
-        self.move_to_pose(pregrasp)
+        # 5. Retreat with the book, keeping the pregrasp pose around so
+        # place_in_bin can be reasoned about relative to it if needed later.
+        if not self.move_to_pose(pregrasp):
+            response.success = False
+            response.message = f'failed to retreat after grasping row {request.row}'
+            return response
+        self._pregrasp_pose = pregrasp
 
+        response.success = True
+        response.message = f'grasped book at row {request.row}'
+        return response
+
+    def _on_place_in_bin(self, request, response):
         # 6. Move to the bin
         if not self.move_to_pose(self.bin_pose):
-            return
+            response.success = False
+            response.message = 'failed to plan/execute move to collection bin'
+            return response
 
         # 7. Release the book
         self.set_gripper(self.gripper_open)
 
-        self.get_logger().info('Pick-and-place sequence complete')
+        response.success = True
+        response.message = 'book placed in bin'
+        return response
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = ArmManipulationNode()
-
-    # Wait for the perception pose here in the main thread rather than
-    # triggering the pick-and-place sequence from inside the subscription
-    # callback -- move_to_pose() blocks on spin_until_future_complete(),
-    # and nesting that inside an already-running spin() is unsafe in rclpy.
+    # MultiThreadedExecutor lets the blocking move_to_pose() calls inside
+    # a service callback run without stalling the /erc/target_book_pose
+    # subscription (same pattern as state_machine_node).
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        while rclpy.ok() and not node.task_started:
-            rclpy.spin_once(node, timeout_sec=0.1)
-
-        if rclpy.ok() and node.pending_pose is not None:
-            node.run_pick_and_place(node.pending_pose)
-
-        # Keep the node alive afterward (e.g. for TF, or in case you add
-        # a reset trigger later) instead of exiting immediately.
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

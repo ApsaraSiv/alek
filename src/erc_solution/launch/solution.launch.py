@@ -1,12 +1,23 @@
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
     shelf_column_number = LaunchConfiguration('shelf_column_number')
     book_colour = LaunchConfiguration('book_colour')
+
+    # arm_manipulation_node talks to move_group over the MoveGroup action
+    # interface -- nothing else in the bringup starts it, so it has to be
+    # brought up alongside the rest of the solution.
+    move_group_launch = os.path.join(
+        get_package_share_directory('tiago_pro_right_arm_moveit_config'),
+        'launch', 'move_group.launch.py')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -50,11 +61,16 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # Manipulation
+        # Manipulation -- move_group (MoveIt) must be up before
+        # arm_manipulation_node's first grasp_book call, which blocks on
+        # the /move_action action server.
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(move_group_launch),
+        ),
         Node(
-            package='erc_solution',
-            executable='manipulation_node',
-            name='manipulation_node',
+            package='aleksandria',
+            executable='arm_manipulation_node',
+            name='arm_manipulation_node',
             output='screen',
         ),
 
